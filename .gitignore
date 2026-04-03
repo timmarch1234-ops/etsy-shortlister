@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+debug_*.png
+etsy.db
+screenshots/

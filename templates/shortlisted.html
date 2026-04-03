@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Etsy Product Shortlister - Shortlisted</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav>
+        <a href="/">Search</a>
+        <a href="/shortlisted" class="active">Shortlisted</a>
+    </nav>
+
+    <div class="container">
+        <h1>Shortlisted Products</h1>
+
+        <div class="filter-bar">
+            <input type="text" id="filterKeyword" placeholder="Filter by keyword..." oninput="loadProducts()" />
+            <span id="resultCount"></span>
+        </div>
+
+        <div id="products" class="products-grid"></div>
+    </div>
+
+    <!-- Screenshot modal -->
+    <div id="modal" class="modal hidden" onclick="closeModal(event)">
+        <div class="modal-content">
+            <span class="modal-close" onclick="document.getElementById('modal').classList.add('hidden')">&times;</span>
+            <img id="modalImg" src="" />
+        </div>
+    </div>
+
+    <script>
+        function loadProducts() {
+            const keyword = document.getElementById('filterKeyword').value.trim();
+            const url = keyword ? `/api/products?keyword=${encodeURIComponent(keyword)}` : '/api/products';
+
+            fetch(url)
+                .then(r => r.json())
+                .then(products => {
+                    document.getElementById('resultCount').textContent = `${products.length} product${products.length !== 1 ? 's' : ''}`;
+
+                    const grid = document.getElementById('products');
+                    if (products.length === 0) {
+                        grid.innerHTML = '<div class="empty-state">No shortlisted products yet. <a href="/">Run a search</a> to find products.</div>';
+                        return;
+                    }
+
+                    grid.innerHTML = products.map(p => `
+                        <div class="product-card">
+                            <div class="product-image">
+                                ${p.image_url ? `<img src="${p.image_url}" alt="${p.title}" loading="lazy" />` : '<div class="no-image">No Image</div>'}
+                            </div>
+                            <div class="product-info">
+                                <h3 class="product-title">${p.title || 'Untitled'}</h3>
+                                <div class="sold-badge">${p.sold_count}</div>
+                                <div class="product-keyword">Keyword: ${p.keyword}</div>
+                                <div class="product-actions">
+                                    <a href="${p.url}" target="_blank" class="btn-link">View on Etsy</a>
+                                    ${p.screenshot_path ? `<button class="btn-screenshot" onclick="showScreenshot('/screenshots/${p.screenshot_path}')">Screenshot</button>` : ''}
+                                    <button class="btn-delete" onclick="deleteProduct(${p.id})">Remove</button>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                });
+        }
+
+        function showScreenshot(src) {
+            document.getElementById('modalImg').src = src;
+            document.getElementById('modal').classList.remove('hidden');
+        }
+
+        function closeModal(e) {
+            if (e.target === document.getElementById('modal')) {
+                document.getElementById('modal').classList.add('hidden');
+            }
+        }
+
+        function deleteProduct(id) {
+            if (!confirm('Remove this product from shortlist?')) return;
+            fetch(`/api/products/${id}`, { method: 'DELETE' })
+                .then(() => loadProducts());
+        }
+
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') document.getElementById('modal').classList.add('hidden');
+        });
+
+        loadProducts();
+    </script>
+</body>
+</html>

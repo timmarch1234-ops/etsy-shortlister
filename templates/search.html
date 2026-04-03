@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Etsy Product Shortlister - Search</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav>
+        <a href="/" class="active">Search</a>
+        <a href="/shortlisted">Shortlisted</a>
+    </nav>
+
+    <div class="container">
+        <h1>Etsy Product Shortlister</h1>
+        <p class="subtitle">Search for products and find items bought in the past 24 hours</p>
+
+        <div class="setup-notice" id="setupNotice">
+            <strong>Note:</strong> Searches run a headless browser in the background to browse Etsy.
+            The first search may take a moment to start up.
+        </div>
+
+        <div class="search-box">
+            <input type="text" id="keyword" placeholder="Enter search keyword (e.g. handmade candles)" />
+            <button id="searchBtn" onclick="startSearch()">Search</button>
+        </div>
+
+        <div id="progress" class="progress-panel hidden">
+            <h3>Search Progress</h3>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="progress-stats">
+                <span id="pageInfo">Page 0 / 20</span>
+                <span id="listingsChecked">Listings checked: 0</span>
+                <span id="productsFound">Products found: 0</span>
+                <span id="statusText">Starting...</span>
+            </div>
+            <button id="cancelBtn" class="cancel-btn" onclick="cancelSearch()">Cancel</button>
+            <div class="log-container">
+                <h4>Log</h4>
+                <div id="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentSearchId = null;
+        let pollInterval = null;
+
+        function startSearch() {
+            const keyword = document.getElementById('keyword').value.trim();
+            if (!keyword) return alert('Please enter a keyword');
+
+            document.getElementById('searchBtn').disabled = true;
+            document.getElementById('progress').classList.remove('hidden');
+            document.getElementById('log').innerHTML = '';
+
+            fetch('/api/search', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keyword })
+            })
+            .then(r => r.json())
+            .then(data => {
+                currentSearchId = data.search_id;
+                pollInterval = setInterval(pollStatus, 1500);
+            });
+        }
+
+        function pollStatus() {
+            if (!currentSearchId) return;
+
+            fetch(`/api/search/${currentSearchId}/status`)
+                .then(r => r.json())
+                .then(data => {
+                    const pct = (data.current_page / data.total_pages) * 100;
+                    document.getElementById('progressBar').style.width = pct + '%';
+                    document.getElementById('pageInfo').textContent = `Page ${data.current_page} / ${data.total_pages}`;
+                    document.getElementById('listingsChecked').textContent = `Listings checked: ${data.listings_checked}`;
+                    document.getElementById('productsFound').textContent = `Products found: ${data.products_found}`;
+                    document.getElementById('statusText').textContent = data.status === 'running' ? 'Running...' : data.status;
+
+                    const logDiv = document.getElementById('log');
+                    logDiv.innerHTML = data.log.map(l =>
+                        `<div class="${l.startsWith('MATCH') ? 'log-match' : ''}">${l}</div>`
+                    ).join('');
+                    logDiv.scrollTop = logDiv.scrollHeight;
+
+                    if (data.status !== 'running') {
+                        clearInterval(pollInterval);
+                        document.getElementById('searchBtn').disabled = false;
+                        document.getElementById('cancelBtn').style.display = 'none';
+                        if (data.products_found > 0) {
+                            document.getElementById('statusText').innerHTML =
+                                `Done! Found ${data.products_found} products. <a href="/shortlisted">View Shortlisted &rarr;</a>`;
+                        }
+                    }
+                });
+        }
+
+        function cancelSearch() {
+            if (!currentSearchId) return;
+            fetch(`/api/search/${currentSearchId}/cancel`, { method: 'POST' });
+        }
+
+        document.getElementById('keyword').addEventListener('keypress', e => {
+            if (e.key === 'Enter') startSearch();
+        });
+    </script>
+</body>
+</html>
