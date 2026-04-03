@@ -30,6 +30,12 @@ function saveState() {
 
 function broadcast() {
   chrome.runtime.sendMessage({ type: "progress", state }).catch(() => {});
+  // Also send to all tabs running the content script
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      chrome.tabs.sendMessage(tab.id, { type: "progress", state }).catch(() => {});
+    }
+  });
 }
 
 async function sleep(ms) {
@@ -69,6 +75,23 @@ function navigateTab(tabId, url) {
     chrome.tabs.onUpdated.addListener(listener);
     chrome.tabs.update(tabId, { url });
   });
+}
+
+// Check if page has a CAPTCHA
+async function hasCaptcha(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const title = document.title || "";
+      const iframes = document.querySelectorAll("iframe");
+      const divs = document.querySelectorAll("div");
+      // DataDome CAPTCHA: nearly empty page with an iframe
+      if (divs.length < 5 && iframes.length > 0 && title.length < 20) return true;
+      if (document.body?.innerText?.toLowerCase().includes("captcha")) return true;
+      return false;
+    },
+  });
+  return results[0]?.result || false;
 }
 
 // Extract listing URLs from an Etsy search results page using scripting API
@@ -153,6 +176,21 @@ async function runSearch(keyword, backendUrl) {
         log(`Page ${page}: Failed to load - ${e.message}`);
         continue;
       }
+
+      // Check for CAPTCHA
+      try {
+        if (await hasCaptcha(searchTabId)) {
+          log(`CAPTCHA detected! Please solve it in the Etsy tab, then restart the search.`);
+          state.status = "error";
+          saveState();
+          broadcast();
+          if (searchTabId) {
+            // Focus the tab so user can see the CAPTCHA
+            chrome.tabs.update(searchTabId, { active: true });
+          }
+          return;
+        }
+      } catch (e) {}
 
       let listingUrls;
       try {
