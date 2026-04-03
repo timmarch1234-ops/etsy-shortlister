@@ -94,52 +94,91 @@ async function hasCaptcha(tabId) {
   return results[0]?.result || false;
 }
 
-// Extract listing URLs from an Etsy search results page using scripting API
-async function extractListingUrls(tabId) {
+// Extract products with demand signals directly from search results page
+// This avoids visiting each listing individually (which triggers rate limits)
+async function extractProductsFromSearchPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
-      const links = document.querySelectorAll('a[href*="/listing/"]');
-      const seen = new Set();
-      const urls = [];
-      links.forEach((a) => {
-        const match = a.href.match(/\/listing\/(\d+)/);
-        if (match && !seen.has(match[1])) {
-          seen.add(match[1]);
-          urls.push(`https://www.etsy.com/listing/${match[1]}`);
-        }
+      const products = [];
+      // Etsy search results are in listing cards
+      // Look for all listing links and their surrounding context
+      const listingCards = document.querySelectorAll('[data-listing-id], .v2-listing-card, .wt-grid__item-xs-6');
+
+      if (listingCards.length > 0) {
+        listingCards.forEach((card) => {
+          const text = card.innerText || "";
+          const boughtMatch = text.match(
+            /(\d+\+?)\s+(?:people\s+)?bought\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
+          );
+          const basketMatch = text.match(/[Ii]n\s+(\d+\+?)\s+baskets?/i);
+          const demandMatch = boughtMatch || basketMatch;
+
+          if (demandMatch) {
+            const link = card.querySelector('a[href*="/listing/"]');
+            const img = card.querySelector('img');
+            const titleEl = card.querySelector('h3, h2, [class*="title"], .v2-listing-card__title');
+
+            if (link) {
+              products.push({
+                title: titleEl?.textContent?.trim() || "",
+                url: link.href.split("?")[0],
+                image_url: img?.src || "",
+                sold_count: demandMatch[0].trim(),
+              });
+            }
+          }
+        });
+      }
+
+      // Fallback: scan the full page text for demand signals near listing links
+      if (products.length === 0) {
+        const allLinks = document.querySelectorAll('a[href*="/listing/"]');
+        const seen = new Set();
+        allLinks.forEach((link) => {
+          const listingMatch = link.href.match(/\/listing\/(\d+)/);
+          if (!listingMatch || seen.has(listingMatch[1])) return;
+
+          // Check the parent elements for demand signals
+          let el = link;
+          for (let i = 0; i < 5; i++) {
+            el = el.parentElement;
+            if (!el) break;
+            const text = el.innerText || "";
+            const boughtMatch = text.match(
+              /(\d+\+?)\s+(?:people\s+)?bought\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
+            );
+            const basketMatch = text.match(/[Ii]n\s+(\d+\+?)\s+baskets?/i);
+            const demandMatch = boughtMatch || basketMatch;
+
+            if (demandMatch) {
+              seen.add(listingMatch[1]);
+              const img = el.querySelector('img');
+              const titleEl = el.querySelector('h3, h2');
+              products.push({
+                title: titleEl?.textContent?.trim() || "",
+                url: `https://www.etsy.com/listing/${listingMatch[1]}`,
+                image_url: img?.src || "",
+                sold_count: demandMatch[0].trim(),
+              });
+              break;
+            }
+          }
+        });
+      }
+
+      // Also return total listing count for progress
+      const allListingLinks = document.querySelectorAll('a[href*="/listing/"]');
+      const uniqueIds = new Set();
+      allListingLinks.forEach((a) => {
+        const m = a.href.match(/\/listing\/(\d+)/);
+        if (m) uniqueIds.add(m[1]);
       });
-      return urls;
+
+      return { products, totalListings: uniqueIds.size };
     },
   });
-  return results[0]?.result || [];
-}
-
-// Check a listing page for demand signals using scripting API
-async function checkListingPage(tabId) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const bodyText = document.body?.innerText || "";
-
-      // Check for "X bought in past 24 hours" or "In X baskets"
-      const boughtMatch = bodyText.match(
-        /(\d+\+?)\s+(?:people\s+)?bought\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
-      );
-      const basketMatch = bodyText.match(/In\s+(\d+\+?)\s+baskets?/i);
-      const match = boughtMatch || basketMatch;
-
-      if (!match) return null;
-
-      const soldCount = match[0].trim();
-      const title = document.title?.split(" - Etsy")[0]?.trim() || "";
-      const ogImg = document.querySelector('meta[property="og:image"]');
-      const imageUrl = ogImg?.content || "";
-
-      return { soldCount, title, imageUrl };
-    },
-  });
-  return results[0]?.result || null;
+  return results[0]?.result || { products: [], totalListings: 0 };
 }
 
 async function runSearch(keyword, backendUrl) {
@@ -152,7 +191,7 @@ async function runSearch(keyword, backendUrl) {
   try {
     log("Starting search...");
 
-    // Create a tab for searching (minimized in background)
+    // Create a tab for searching (in background)
     const tab = await chrome.tabs.create({ url: "about:blank", active: false });
     searchTabId = tab.id;
 
@@ -163,86 +202,65 @@ async function runSearch(keyword, backendUrl) {
       }
 
       state.currentPage = page;
-      log(`Searching page ${page} of 20...`);
+      log(`Scanning page ${page} of 20...`);
       broadcast();
 
       const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(keyword)}&ref=search_bar&page=${page}`;
 
       try {
         await navigateTab(searchTabId, searchUrl);
-        // Extra wait for dynamic content
-        await sleep(2000);
+        // Wait for page to fully render
+        await sleep(3000 + Math.random() * 2000);
       } catch (e) {
         log(`Page ${page}: Failed to load - ${e.message}`);
         continue;
       }
 
-      // Check for CAPTCHA
+      // Check for CAPTCHA / ban
       try {
         if (await hasCaptcha(searchTabId)) {
-          log(`CAPTCHA detected! Please solve it in the Etsy tab, then restart the search.`);
+          log(`CAPTCHA/ban detected! Please solve it in the Etsy tab, then restart the search.`);
           state.status = "error";
           saveState();
           broadcast();
           if (searchTabId) {
-            // Focus the tab so user can see the CAPTCHA
             chrome.tabs.update(searchTabId, { active: true });
           }
           return;
         }
       } catch (e) {}
 
-      let listingUrls;
+      // Extract products with demand signals directly from the search page
+      let result;
       try {
-        listingUrls = await extractListingUrls(searchTabId);
+        result = await extractProductsFromSearchPage(searchTabId);
       } catch (e) {
-        log(`Page ${page}: Failed to extract listings - ${e.message}`);
+        log(`Page ${page}: Failed to extract - ${e.message}`);
         continue;
       }
 
-      log(`Page ${page}: Found ${listingUrls.length} listings to check.`);
+      state.listingsChecked += result.totalListings;
 
-      if (listingUrls.length === 0 && page > 1) continue;
-
-      for (const listingUrl of listingUrls) {
-        if (state.cancelled) break;
-
-        state.listingsChecked++;
-
-        // Polite delay
-        await sleep(1000 + Math.random() * 1500);
-
-        try {
-          await navigateTab(searchTabId, listingUrl);
-          await sleep(1500);
-
-          const result = await checkListingPage(searchTabId);
-
-          if (result) {
-            matchingProducts.push({
-              title: result.title,
-              url: listingUrl,
-              image_url: result.imageUrl,
-              sold_count: result.soldCount,
-            });
-
-            state.productsFound++;
-            log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
-
-            // Send batch every 5 matches
-            if (matchingProducts.length >= 5) {
-              await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-            }
-          }
-        } catch (e) {
-          log(`Error checking listing: ${e.message}`);
+      if (result.products.length > 0) {
+        for (const p of result.products) {
+          matchingProducts.push(p);
+          state.productsFound++;
+          log(`MATCH: ${p.sold_count} - ${p.title.substring(0, 60)}`);
         }
 
-        broadcast();
+        // Send batch every 5 matches
+        if (matchingProducts.length >= 5) {
+          await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
+        }
       }
 
-      // Small delay between pages
-      await sleep(2000 + Math.random() * 2000);
+      log(`Page ${page}: ${result.totalListings} listings, ${result.products.length} with demand signals.`);
+      broadcast();
+
+      if (result.totalListings === 0 && page > 1) continue;
+
+      // Longer delay between pages to avoid rate limits
+      await sleep(4000 + Math.random() * 3000);
     }
 
     // Send remaining matches
@@ -388,60 +406,54 @@ async function runQueuedSearch(keyword, queueSearchId, backendUrl) {
 
       try {
         await navigateTab(searchTabId, searchUrl);
-        await sleep(2000);
+        await sleep(3000 + Math.random() * 2000);
       } catch (e) {
         log(`Page ${page}: Failed to load - ${e.message}`);
         continue;
       }
 
-      let listingUrls;
+      // Check for CAPTCHA / ban
       try {
-        listingUrls = await extractListingUrls(searchTabId);
+        if (await hasCaptcha(searchTabId)) {
+          log(`CAPTCHA/ban detected! Please solve it in the Etsy tab, then restart the search.`);
+          state.status = "error";
+          saveState();
+          broadcast();
+          if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
+          await reportProgress("error");
+          return;
+        }
+      } catch (e) {}
+
+      let result;
+      try {
+        result = await extractProductsFromSearchPage(searchTabId);
       } catch (e) {
-        log(`Page ${page}: Failed to extract listings - ${e.message}`);
+        log(`Page ${page}: Failed to extract - ${e.message}`);
         continue;
       }
 
-      log(`Page ${page}: Found ${listingUrls.length} listings to check.`);
+      state.listingsChecked += result.totalListings;
 
-      if (listingUrls.length === 0 && page > 1) continue;
-
-      for (const listingUrl of listingUrls) {
-        if (state.cancelled) break;
-
-        state.listingsChecked++;
-        await sleep(1000 + Math.random() * 1500);
-
-        try {
-          await navigateTab(searchTabId, listingUrl);
-          await sleep(1500);
-
-          const result = await checkListingPage(searchTabId);
-
-          if (result) {
-            matchingProducts.push({
-              title: result.title,
-              url: listingUrl,
-              image_url: result.imageUrl,
-              sold_count: result.soldCount,
-            });
-
-            state.productsFound++;
-            log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
-
-            if (matchingProducts.length >= 5) {
-              await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-            }
-          }
-        } catch (e) {
-          log(`Error checking listing: ${e.message}`);
+      if (result.products.length > 0) {
+        for (const p of result.products) {
+          matchingProducts.push(p);
+          state.productsFound++;
+          log(`MATCH: ${p.sold_count} - ${p.title.substring(0, 60)}`);
         }
 
-        broadcast();
-        await reportProgress("running");
+        if (matchingProducts.length >= 5) {
+          await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
+        }
       }
 
-      await sleep(2000 + Math.random() * 2000);
+      log(`Page ${page}: ${result.totalListings} listings, ${result.products.length} with demand signals.`);
+      broadcast();
+      await reportProgress("running");
+
+      if (result.totalListings === 0 && page > 1) continue;
+
+      await sleep(4000 + Math.random() * 3000);
     }
 
     if (matchingProducts.length > 0) {
