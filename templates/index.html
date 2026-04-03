@@ -52,13 +52,28 @@
         const logDiv = document.getElementById('log');
 
         let currentSearchId = null;
-        let eventSource = null;
+        let pollInterval = null;
+        let extensionReady = false;
 
         keywordInput.addEventListener('keypress', e => {
             if (e.key === 'Enter') startSearch();
         });
 
-        function startSearch() {
+        // Listen for extension content script
+        window.addEventListener('message', (event) => {
+            if (event.source !== window) return;
+            if (event.data?.type === 'ETSY_EXTENSION_READY') {
+                extensionReady = true;
+            }
+            if (event.data?.type === 'ETSY_PROGRESS') {
+                renderExtensionState(event.data.state);
+            }
+            if (event.data?.type === 'ETSY_STATE' && event.data.state) {
+                renderExtensionState(event.data.state);
+            }
+        });
+
+        async function startSearch() {
             const keyword = keywordInput.value.trim();
             if (!keyword) return;
 
@@ -69,61 +84,104 @@
             logDiv.innerHTML = '';
             cancelBtn.style.display = 'inline-block';
 
-            if (eventSource) eventSource.close();
-
-            eventSource = new EventSource(`/api/search?keyword=${encodeURIComponent(keyword)}`);
-
-            eventSource.onmessage = function(e) {
-                const data = JSON.parse(e.data);
-
-                if (data.type === 'init') {
+            if (extensionReady) {
+                // Use extension (searches via user's browser session)
+                addLog('Using Chrome extension to search...', false);
+                window.postMessage({
+                    type: 'ETSY_START_SEARCH',
+                    keyword: keyword,
+                    backendUrl: window.location.origin,
+                }, '*');
+            } else {
+                // Use server-side queue (Playwright)
+                try {
+                    const resp = await fetch('/api/queue', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ keyword }),
+                    });
+                    const data = await resp.json();
                     currentSearchId = data.search_id;
+                    addLog('Search started on server...', false);
+                    pollInterval = setInterval(pollProgress, 1000);
+                } catch (e) {
+                    progressTitle.textContent = 'Error starting search.';
+                    searchBtn.disabled = false;
+                    addLog('Error: ' + e.message, false);
                 }
-                else if (data.type === 'status') {
-                    const pct = data.totalPages > 0 ? (data.page / data.totalPages) * 100 : 0;
-                    progressBar.style.width = pct + '%';
-                    pageInfo.textContent = `Page ${data.page}/${data.totalPages}`;
-                    checkedEl.textContent = `Checked: ${data.checked}`;
-                    foundEl.textContent = `Found: ${data.found}`;
+            }
+        }
+
+        async function pollProgress() {
+            if (!currentSearchId) return;
+            try {
+                const resp = await fetch('/api/queue/' + currentSearchId + '/progress');
+                const data = await resp.json();
+                const p = data.progress || {};
+
+                const pct = p.totalPages > 0 ? (p.currentPage / p.totalPages) * 100 : 0;
+                progressBar.style.width = pct + '%';
+                pageInfo.textContent = 'Page ' + (p.currentPage || 0) + '/' + (p.totalPages || 5);
+                checkedEl.textContent = 'Checked: ' + (p.listingsChecked || 0);
+                foundEl.textContent = 'Found: ' + (p.productsFound || 0);
+
+                if (p.log && p.log.length > 0) {
+                    logDiv.innerHTML = p.log.map(function(l) {
+                        return '<div class="' + (l.startsWith('MATCH') ? 'log-match' : '') + '">' + escapeHtml(l) + '</div>';
+                    }).join('');
+                    logDiv.scrollTop = logDiv.scrollHeight;
                 }
-                else if (data.type === 'log') {
-                    addLog(data.message, false);
-                }
-                else if (data.type === 'match') {
-                    addLog(data.message, true);
-                }
-                else if (data.type === 'done') {
+
+                if (data.status === 'running') {
+                    progressTitle.textContent = 'Searching...';
+                } else if (data.status === 'completed') {
                     progressBar.style.width = '100%';
-                    progressTitle.textContent = data.cancelled
-                        ? 'Search cancelled'
-                        : `Done! Found ${data.found} trending product${data.found !== 1 ? 's' : ''}.`;
+                    progressTitle.textContent = 'Done! Found ' + (p.productsFound || 0) + ' trending product(s).';
                     searchBtn.disabled = false;
                     cancelBtn.style.display = 'none';
-                    eventSource.close();
-                    eventSource = null;
-
-                    if (data.found > 0) {
-                        addLog(`View results on the Shortlisted page.`, false);
-                    }
+                    clearInterval(pollInterval);
+                    if ((p.productsFound || 0) > 0) addLog('View results on the Shortlisted page.', false);
+                } else if (data.status === 'cancelled' || data.status === 'error') {
+                    progressTitle.textContent = data.status === 'cancelled' ? 'Search cancelled.' : 'Search failed.';
+                    searchBtn.disabled = false;
+                    cancelBtn.style.display = 'none';
+                    clearInterval(pollInterval);
                 }
-            };
+            } catch (e) {}
+        }
 
-            eventSource.onerror = function() {
-                progressTitle.textContent = 'Connection lost. Search may still be running.';
+        function renderExtensionState(s) {
+            if (!s) return;
+            progressPanel.classList.remove('hidden');
+            const pct = s.totalPages > 0 ? (s.currentPage / s.totalPages) * 100 : 0;
+            progressBar.style.width = pct + '%';
+            pageInfo.textContent = 'Page ' + s.currentPage + '/' + s.totalPages;
+            checkedEl.textContent = 'Checked: ' + s.listingsChecked;
+            foundEl.textContent = 'Found: ' + s.productsFound;
+
+            if (s.status === 'running') {
+                progressTitle.textContent = 'Searching...';
+                searchBtn.disabled = true;
+                cancelBtn.style.display = 'inline-block';
+            } else {
+                progressTitle.textContent = s.status === 'completed'
+                    ? 'Done! Found ' + s.productsFound + ' trending product(s).'
+                    : s.status;
                 searchBtn.disabled = false;
                 cancelBtn.style.display = 'none';
-                eventSource.close();
-                eventSource = null;
-            };
+            }
+
+            logDiv.innerHTML = (s.log || []).map(function(l) {
+                return '<div class="' + (l.startsWith('MATCH') ? 'log-match' : '') + '">' + escapeHtml(l) + '</div>';
+            }).join('');
+            logDiv.scrollTop = logDiv.scrollHeight;
         }
 
         function cancelSearch() {
-            if (currentSearchId) {
-                fetch(`/api/search/${currentSearchId}/cancel`, { method: 'POST' });
-            }
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
+            if (extensionReady) {
+                window.postMessage({ type: 'ETSY_CANCEL_SEARCH' }, '*');
+            } else if (currentSearchId) {
+                fetch('/api/queue/' + currentSearchId + '/cancel', { method: 'POST' });
             }
             progressTitle.textContent = 'Cancelling...';
             cancelBtn.style.display = 'none';
@@ -136,6 +194,12 @@
             div.textContent = message;
             logDiv.appendChild(div);
             logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
         }
     </script>
 </body>

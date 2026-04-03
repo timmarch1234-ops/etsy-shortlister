@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>Etsy Shortlister</h1>
+  </div>
+
+  <div class="section" id="settingsSection">
+    <button class="toggle-btn" id="settingsToggle">Settings</button>
+    <div class="settings-body hidden" id="settingsBody">
+      <label>Backend URL</label>
+      <input type="text" id="backendUrl" placeholder="https://..." />
+      <button class="save-btn" id="saveSettings">Save</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="search-row">
+      <input type="text" id="keyword" placeholder="Search keyword (e.g. handmade candles)" />
+      <button id="searchBtn">Search</button>
+    </div>
+  </div>
+
+  <div class="section hidden" id="progressSection">
+    <div class="progress-bar-bg">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="stats">
+      <span id="pageInfo">Page 0/20</span>
+      <span id="checked">Checked: 0</span>
+      <span id="found">Found: 0</span>
+      <span id="statusText">Starting...</span>
+    </div>
+    <button class="cancel-btn" id="cancelBtn">Cancel</button>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="footer">
+    <a id="dashboardLink" href="#" target="_blank">View Dashboard</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
