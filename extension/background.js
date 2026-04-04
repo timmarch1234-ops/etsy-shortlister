@@ -3,6 +3,8 @@ const DEFAULT_BACKEND = "https://etsy-shortlister-production-3d4e.up.railway.app
 let state = null;
 let searchTabId = null;
 let activeTabs = [];
+let lastMouseX = 400;
+let lastMouseY = 300;
 
 function defaultState(keyword, totalPages) {
   return {
@@ -82,10 +84,7 @@ function waitForTabComplete(tabId, timeoutMs = 20000) {
   return new Promise((resolve) => {
     let settled = false;
     const done = () => {
-      if (!settled) {
-        settled = true;
-        resolve();
-      }
+      if (!settled) { settled = true; resolve(); }
     };
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
@@ -101,19 +100,14 @@ function waitForTabComplete(tabId, timeoutMs = 20000) {
     chrome.tabs.onUpdated.addListener(listener);
     try {
       chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError) {
-          done();
-          return;
-        }
+        if (chrome.runtime.lastError) { done(); return; }
         if (tab && tab.status === "complete") {
           chrome.tabs.onUpdated.removeListener(listener);
           clearTimeout(timeout);
           done();
         }
       });
-    } catch (e) {
-      done();
-    }
+    } catch (e) { done(); }
   });
 }
 
@@ -122,155 +116,231 @@ async function waitForAllTabs(tabIds, timeoutMs = 20000) {
 }
 
 async function closeTab(tabId) {
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch (e) {}
+  try { await chrome.tabs.remove(tabId); } catch (e) {}
 }
 
 // ============================================================
-// HUMAN SIMULATION — Bezier curve mouse movement
+// CHROME DEVTOOLS PROTOCOL — TRUSTED INPUT EVENTS
 //
-// Real humans move the mouse in smooth curves, not straight
-// lines or random jumps. We use cubic Bezier curves with
-// randomized control points — the same technique ghost-cursor
-// and other anti-detection libraries use.
+// chrome.debugger dispatches events via CDP, producing
+// isTrusted: true events. DataDome cannot distinguish these
+// from real human input. This is the same mechanism that
+// Puppeteer and Playwright use under the hood.
 // ============================================================
 
-// Inject Bezier mouse path + micro-movements on a page
-async function humanMouseMovement(tabId) {
+const debuggerTabs = new Set();
+
+async function attachDebugger(tabId) {
+  if (debuggerTabs.has(tabId)) return true;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        // Cubic Bezier interpolation
-        function bezier(t, p0, p1, p2, p3) {
-          const u = 1 - t;
-          return (
-            u * u * u * p0 +
-            3 * u * u * t * p1 +
-            3 * u * t * t * p2 +
-            t * t * t * p3
-          );
+    await new Promise((resolve, reject) => {
+      chrome.debugger.attach({ tabId }, "1.3", () => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve();
         }
-
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-
-        // Start from a natural position (center-ish area)
-        const startX = w * (0.2 + Math.random() * 0.6);
-        const startY = h * (0.2 + Math.random() * 0.5);
-
-        // End at another natural position
-        const endX = w * (0.1 + Math.random() * 0.7);
-        const endY = h * (0.15 + Math.random() * 0.6);
-
-        // Random control points create the human curve
-        const cp1x = startX + (Math.random() - 0.5) * w * 0.4;
-        const cp1y = startY + (Math.random() - 0.3) * h * 0.4;
-        const cp2x = endX + (Math.random() - 0.5) * w * 0.4;
-        const cp2y = endY + (Math.random() - 0.3) * h * 0.4;
-
-        // 15-30 points along the curve
-        const steps = 15 + Math.floor(Math.random() * 16);
-
-        for (let i = 0; i <= steps; i++) {
-          const t = i / steps;
-          // Add micro-jitter (hand tremor)
-          const jitterX = (Math.random() - 0.5) * 3;
-          const jitterY = (Math.random() - 0.5) * 3;
-          const x = Math.max(
-            2,
-            Math.min(w - 2, bezier(t, startX, cp1x, cp2x, endX) + jitterX)
-          );
-          const y = Math.max(
-            2,
-            Math.min(h - 2, bezier(t, startY, cp1y, cp2y, endY) + jitterY)
-          );
-
-          const el = document.elementFromPoint(x, y) || document.body;
-          el.dispatchEvent(
-            new MouseEvent("mousemove", {
-              clientX: x,
-              clientY: y,
-              bubbles: true,
-              cancelable: true,
-            })
-          );
-        }
-      },
-    });
-  } catch (e) {}
-}
-
-// Scroll search page down to the next row of results
-async function scrollToNextRow(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        // Etsy shows ~4 items per row, each card is ~320-380px tall
-        // Scroll roughly one row height with some variance
-        const rowHeight = 300 + Math.random() * 100;
-        window.scrollBy({ top: rowHeight, behavior: "smooth" });
-      },
-    });
-  } catch (e) {}
-  // Wait for smooth scroll to finish
-  await sleep(400 + Math.random() * 400);
-}
-
-// Simulate browsing a listing page (scroll down, mouse movement)
-async function browseListingPage(tabId) {
-  // Mouse movement (reading the title area)
-  await humanMouseMovement(tabId);
-
-  // Scroll down a bit (looking at images/description)
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const amount = 200 + Math.random() * 500;
-        window.scrollBy({ top: amount, behavior: "smooth" });
-      },
-    });
-  } catch (e) {}
-
-  await sleep(200 + Math.random() * 500);
-
-  // Another small mouse movement
-  await humanMouseMovement(tabId);
-}
-
-// Full human simulation on search page (initial browse)
-async function browseSearchPage(tabId) {
-  await humanMouseMovement(tabId);
-  // Scroll through the page naturally in 2-4 stages
-  const scrollSteps = 2 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < scrollSteps; i++) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const px = 250 + Math.random() * 450;
-          window.scrollBy({ top: px, behavior: "smooth" });
-        },
       });
-    } catch (e) {}
-    await sleep(500 + Math.random() * 800);
-    await humanMouseMovement(tabId);
+    });
+    debuggerTabs.add(tabId);
+    return true;
+  } catch (e) {
+    console.log("Debugger attach failed:", e.message);
+    return false;
   }
-  // Scroll back to top to start row-by-row
+}
+
+async function detachDebugger(tabId) {
+  if (!debuggerTabs.has(tabId)) return;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => window.scrollTo({ top: 0, behavior: "smooth" }),
+    await new Promise((resolve) => {
+      chrome.debugger.detach({ tabId }, () => {
+        resolve();
+      });
     });
   } catch (e) {}
-  await sleep(400 + Math.random() * 600);
+  debuggerTabs.delete(tabId);
+}
+
+// Handle debugger detach (user dismissed the bar, tab closed, etc.)
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId) debuggerTabs.delete(source.tabId);
+});
+
+async function cdpSend(tabId, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(result);
+      }
+    });
+  });
 }
 
 // ============================================================
-// PAGE ANALYSIS
+// TRUSTED MOUSE MOVEMENT — Bezier curves via CDP
+//
+// Generates isTrusted:true mousemove events along a smooth
+// cubic Bezier path with micro-jitter (hand tremor) and
+// variable speed (slower at start/end, faster in middle).
+// ============================================================
+
+async function trustedMouseMove(tabId, toX, toY) {
+  const fromX = lastMouseX;
+  const fromY = lastMouseY;
+  const dist = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
+  const steps = Math.max(8, Math.min(25, Math.round(dist / 15)));
+
+  // Bezier control points — random curves, not straight lines
+  const cp1x = fromX + (toX - fromX) * 0.25 + (Math.random() - 0.5) * 80;
+  const cp1y = fromY + (toY - fromY) * 0.25 + (Math.random() - 0.5) * 60;
+  const cp2x = fromX + (toX - fromX) * 0.75 + (Math.random() - 0.5) * 80;
+  const cp2y = fromY + (toY - fromY) * 0.75 + (Math.random() - 0.5) * 60;
+
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const u = 1 - t;
+    // Cubic Bezier + micro-jitter
+    const x =
+      u * u * u * fromX +
+      3 * u * u * t * cp1x +
+      3 * u * t * t * cp2x +
+      t * t * t * toX +
+      (Math.random() - 0.5) * 2;
+    const y =
+      u * u * u * fromY +
+      3 * u * u * t * cp1y +
+      3 * u * t * t * cp2y +
+      t * t * t * toY +
+      (Math.random() - 0.5) * 2;
+
+    try {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: Math.round(x),
+        y: Math.round(y),
+      });
+    } catch (e) { break; }
+
+    // Easing: slower at start/end, faster in middle
+    const speed = 8 + Math.sin(t * Math.PI) * 18 + Math.random() * 10;
+    await sleep(speed);
+  }
+
+  lastMouseX = Math.round(toX);
+  lastMouseY = Math.round(toY);
+}
+
+// Trusted click at current mouse position
+async function trustedClick(tabId, x, y) {
+  try {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: Math.round(x),
+      y: Math.round(y),
+      button: "left",
+      clickCount: 1,
+    });
+    await sleep(40 + Math.random() * 60);
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: Math.round(x),
+      y: Math.round(y),
+      button: "left",
+      clickCount: 1,
+    });
+  } catch (e) {}
+}
+
+// Trusted scroll via mouseWheel event
+async function trustedScroll(tabId, deltaY) {
+  // Scroll in 2-4 increments (humans don't scroll in one jump)
+  const scrollSteps = 2 + Math.floor(Math.random() * 3);
+  const perStep = deltaY / scrollSteps;
+
+  for (let i = 0; i < scrollSteps; i++) {
+    const jitter = (Math.random() - 0.5) * 30;
+    try {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x: lastMouseX,
+        y: lastMouseY,
+        deltaX: 0,
+        deltaY: Math.round(perStep + jitter),
+      });
+    } catch (e) { break; }
+    await sleep(100 + Math.random() * 200);
+  }
+}
+
+// Trusted keyboard press
+async function trustedKeyPress(tabId, key, code, keyCode) {
+  try {
+    await cdpSend(tabId, "Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key,
+      code,
+      windowsVirtualKeyCode: keyCode,
+      nativeVirtualKeyCode: keyCode,
+    });
+    await sleep(30 + Math.random() * 60);
+    await cdpSend(tabId, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key,
+      code,
+      windowsVirtualKeyCode: keyCode,
+      nativeVirtualKeyCode: keyCode,
+    });
+  } catch (e) {}
+}
+
+// ============================================================
+// HUMAN SIMULATION — Composites
+// ============================================================
+
+// Casually move mouse around the page (idle browsing)
+async function idleMouseWander(tabId) {
+  const moves = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < moves; i++) {
+    const x = 100 + Math.random() * 900;
+    const y = 100 + Math.random() * 500;
+    await trustedMouseMove(tabId, x, y);
+    await sleep(200 + Math.random() * 600);
+  }
+}
+
+// Browse a page naturally: mouse wander + scroll down + more mouse
+async function browsePageNaturally(tabId) {
+  await idleMouseWander(tabId);
+  await sleep(300 + Math.random() * 500);
+
+  // Scroll down in a few stages
+  const scrollStages = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < scrollStages; i++) {
+    await trustedScroll(tabId, 200 + Math.random() * 400);
+    await sleep(400 + Math.random() * 800);
+    // Occasional mouse wander between scrolls
+    if (Math.random() < 0.5) {
+      await idleMouseWander(tabId);
+    }
+  }
+}
+
+// Quick browse on a listing tab (glance + small scroll)
+async function quickBrowseListing(tabId) {
+  // Move mouse around the listing (title, image, details area)
+  await trustedMouseMove(tabId, 300 + Math.random() * 400, 200 + Math.random() * 200);
+  await sleep(150 + Math.random() * 300);
+  await trustedScroll(tabId, 150 + Math.random() * 300);
+  await sleep(100 + Math.random() * 200);
+  // One more mouse move (scanning the page)
+  await trustedMouseMove(tabId, 200 + Math.random() * 600, 300 + Math.random() * 300);
+}
+
+// ============================================================
+// PAGE ANALYSIS (read-only — no events dispatched)
 // ============================================================
 
 async function hasCaptcha(tabId) {
@@ -282,8 +352,7 @@ async function hasCaptcha(tabId) {
         const body = document.body?.innerText || "";
         const iframes = document.querySelectorAll("iframe");
         const divs = document.querySelectorAll("div");
-        if (divs.length < 5 && iframes.length > 0 && title.length < 20)
-          return true;
+        if (divs.length < 5 && iframes.length > 0 && title.length < 20) return true;
         if (body.toLowerCase().includes("captcha")) return true;
         if (body.includes("Access is temporarily restricted")) return true;
         return false;
@@ -295,28 +364,37 @@ async function hasCaptcha(tabId) {
   }
 }
 
-// Extract listing URLs in top-to-bottom, left-to-right order
-async function extractListingUrls(tabId) {
+// Get positions and URLs of all listing links (top-to-bottom order)
+async function getListingPositions(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
       const links = document.querySelectorAll('a[href*="/listing/"]');
       const seen = new Set();
-      const urls = [];
+      const listings = [];
       links.forEach((a) => {
         const m = a.href.match(/\/listing\/(\d+)/);
         if (m && !seen.has(m[1])) {
           seen.add(m[1]);
-          urls.push(`https://www.etsy.com/listing/${m[1]}`);
+          const rect = a.getBoundingClientRect();
+          // Only include links that are visible and have a size
+          if (rect.width > 0 && rect.height > 0) {
+            listings.push({
+              url: `https://www.etsy.com/listing/${m[1]}`,
+              x: rect.left + rect.width * (0.3 + Math.random() * 0.4),
+              y: rect.top + rect.height * (0.3 + Math.random() * 0.4),
+              id: m[1],
+            });
+          }
         }
       });
-      return urls;
+      return listings;
     },
   });
   return results[0]?.result || [];
 }
 
-// Check listing page for "sold/bought in past 24 hours" only
+// Check listing page for "sold/bought in past 24 hours"
 async function checkListingTab(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
@@ -328,8 +406,7 @@ async function checkListingTab(tabId) {
         );
         if (!soldMatch) return null;
         const soldCount = soldMatch[0].trim();
-        const title =
-          document.title?.split(" - Etsy")[0]?.trim() || "";
+        const title = document.title?.split(" - Etsy")[0]?.trim() || "";
         const ogImg = document.querySelector('meta[property="og:image"]');
         const imageUrl = ogImg?.content || "";
         return { soldCount, title, imageUrl };
@@ -342,28 +419,28 @@ async function checkListingTab(tabId) {
 }
 
 // ============================================================
-// MAIN SEARCH — Row-by-row human browsing pattern
+// MAIN SEARCH — Row-by-row with trusted CDP events
 //
-// Exactly mimics how a real person browses Etsy search results:
+// How a real person browses Etsy:
+// 1. Search page loads, they read/scan the results
+// 2. They see a row of ~4 items, mouse moves to one, click
+//    to open in new tab, then next one, etc.
+// 3. They switch to each tab, glance at it, close it
+// 4. Back on search page, scroll down to next row
+// 5. Repeat
 //
-// 1. Land on search page, scroll through it casually
-// 2. Scroll back to top, look at first row of 4 results
-// 3. Ctrl+click all 4 to open in background tabs
-// 4. Switch to each tab, browse it (mouse + scroll), check signal
-// 5. Close all 4 tabs, return to search page
-// 6. Scroll down to next row of 4
-// 7. Repeat until all rows done
-// 8. Go to next search page
-//
-// Anti-detection:
-// - Bezier curve mouse movement (ghost-cursor algorithm)
-// - Real tab switching (document.hidden flips correctly)
-// - Natural smooth scrolling between rows
-// - Variable timing — no two actions take the same time
-// - Dynamic pacing to fit 25-30 min budget
+// Our approach:
+// - chrome.debugger (CDP) for ALL mouse/scroll/keyboard input
+//   → every event is isTrusted:true, indistinguishable from human
+// - chrome.scripting.executeScript ONLY for reading the DOM
+//   (invisible to detection — no events dispatched)
+// - Bezier curve mouse paths with micro-jitter and variable speed
+// - Trusted scroll wheel events in natural increments
+// - Real tab switching with human-like timing
+// - Dynamic pacing to fit within time budget
 // ============================================================
 
-const ROW_SIZE = 4; // Etsy shows 4 items per row
+const ROW_SIZE = 4;
 
 async function runMainSearch(keyword, backendUrl, reportProgress) {
   const totalPages = 20;
@@ -379,33 +456,30 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
     log("Starting search...");
     if (reportProgress) await reportProgress("running");
 
-    // Create main search tab (foreground)
-    const mainTab = await chrome.tabs.create({
-      url: "about:blank",
-      active: true,
-    });
+    // Create search tab (foreground)
+    const mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
     searchTabId = mainTab.id;
 
     // ---- Warm up: visit Etsy homepage ----
     log("Warming up...");
-    try {
-      await navigateTab(searchTabId, "https://www.etsy.com");
-      await sleep(2000 + Math.random() * 3000);
-      await humanMouseMovement(searchTabId);
-      await sleep(1000 + Math.random() * 2000);
-      // Scroll around the homepage like a real person
-      await browseSearchPage(searchTabId);
-      await sleep(1500 + Math.random() * 2000);
-    } catch (e) {}
+    await navigateTab(searchTabId, "https://www.etsy.com");
+    await sleep(2000 + Math.random() * 2000);
 
-    // ---- Process each search page ----
+    // Attach debugger to search tab for trusted events
+    const dbgOk = await attachDebugger(searchTabId);
+    if (!dbgOk) {
+      log("Could not attach debugger. Search may be less stealthy.");
+    }
+
+    // Browse homepage naturally (trusted mouse + scroll)
+    if (dbgOk) {
+      await browsePageNaturally(searchTabId);
+      await sleep(1500 + Math.random() * 2500);
+    }
+
+    // ---- Process search pages ----
     for (let page = 1; page <= totalPages; page++) {
-      if (state.cancelled) {
-        log("Search cancelled.");
-        break;
-      }
-
-      // Time budget check
+      if (state.cancelled) { log("Search cancelled."); break; }
       if (Date.now() - startTime > TIME_BUDGET_MS) {
         log(`Time limit reached at page ${page}.`);
         break;
@@ -416,10 +490,8 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       broadcast();
       if (reportProgress) await reportProgress("running");
 
-      // Navigate to search results page
-      const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(
-        keyword
-      )}&ref=search_bar&page=${page}`;
+      // Navigate to search page
+      const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(keyword)}&ref=search_bar&page=${page}`;
       try {
         await navigateTab(searchTabId, searchUrl);
         await sleep(1500 + Math.random() * 1500);
@@ -427,6 +499,9 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         log(`Page ${page}: Failed to load, skipping.`);
         continue;
       }
+
+      // Re-attach debugger if needed (navigations can detach it)
+      await attachDebugger(searchTabId);
 
       // CAPTCHA check
       if (await hasCaptcha(searchTabId)) {
@@ -439,89 +514,122 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         return;
       }
 
-      // Browse the search page naturally first (scroll through, then back to top)
-      await browseSearchPage(searchTabId);
-      await sleep(300 + Math.random() * 500);
+      // Browse search page naturally (trusted mouse wander + scroll)
+      await browsePageNaturally(searchTabId);
+      await sleep(400 + Math.random() * 600);
 
-      // Extract all listing URLs
-      let listingUrls;
+      // Scroll back to top to start row-by-row
       try {
-        listingUrls = await extractListingUrls(searchTabId);
+        await cdpSend(searchTabId, "Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x: lastMouseX,
+          y: lastMouseY,
+          deltaX: 0,
+          deltaY: -10000,
+        });
+      } catch (e) {}
+      await sleep(500 + Math.random() * 500);
+
+      // Get all listing positions
+      let listings;
+      try {
+        listings = await getListingPositions(searchTabId);
       } catch (e) {
-        log(`Page ${page}: Failed to extract listings.`);
+        log(`Page ${page}: Failed to get listings.`);
         continue;
       }
 
-      if (listingUrls.length === 0) {
+      if (listings.length === 0) {
         log(`Page ${page}: No listings found.`);
         continue;
       }
 
-      log(`Page ${page}: ${listingUrls.length} listings across ${Math.ceil(listingUrls.length / ROW_SIZE)} rows.`);
+      log(`Page ${page}: ${listings.length} listings in ${Math.ceil(listings.length / ROW_SIZE)} rows.`);
 
-      // ---- Dynamic pacing ----
+      // Dynamic pacing
       const timeLeft = TIME_BUDGET_MS - (Date.now() - startTime);
-      const listingsLeft =
-        listingUrls.length + Math.max(0, totalPages - page) * 55;
-      const msPerListing = Math.max(600, timeLeft / Math.max(1, listingsLeft));
+      const listingsLeft = listings.length + Math.max(0, totalPages - page) * 50;
+      const msPerListing = Math.max(500, timeLeft / Math.max(1, listingsLeft));
 
       // ---- Row by row ----
-      for (let rowStart = 0; rowStart < listingUrls.length; rowStart += ROW_SIZE) {
+      for (let rowStart = 0; rowStart < listings.length; rowStart += ROW_SIZE) {
         if (state.cancelled) break;
         if (Date.now() - startTime > TIME_BUDGET_MS) break;
 
-        const rowEnd = Math.min(rowStart + ROW_SIZE, listingUrls.length);
-        const rowUrls = listingUrls.slice(rowStart, rowEnd);
-        const rowNum = Math.floor(rowStart / ROW_SIZE) + 1;
+        const rowEnd = Math.min(rowStart + ROW_SIZE, listings.length);
+        const rowListings = listings.slice(rowStart, rowEnd);
 
-        // If not the first row, scroll down to next row on search page
+        // Scroll search page to make this row visible
         if (rowStart > 0) {
-          // Switch back to search tab
-          try {
-            await chrome.tabs.update(searchTabId, { active: true });
-          } catch (e) {}
-          await sleep(150 + Math.random() * 250);
-          await scrollToNextRow(searchTabId);
-          // Quick mouse movement on search page (scanning the row)
-          await humanMouseMovement(searchTabId);
-          await sleep(200 + Math.random() * 400);
+          await chrome.tabs.update(searchTabId, { active: true });
+          await sleep(100 + Math.random() * 150);
+          // Scroll one row height (~350px)
+          await trustedScroll(searchTabId, 300 + Math.random() * 100);
+          await sleep(300 + Math.random() * 400);
         }
 
-        // ---- Open this row's listings in background tabs ----
+        // Mouse wander over the row (scanning results)
+        if (debuggerTabs.has(searchTabId)) {
+          const centerY = 300 + Math.random() * 200;
+          await trustedMouseMove(searchTabId, 200 + Math.random() * 300, centerY);
+          await sleep(100 + Math.random() * 200);
+        }
+
+        // Re-read positions (may have shifted from scrolling)
+        let freshPositions;
+        try {
+          freshPositions = await getListingPositions(searchTabId);
+        } catch (e) {
+          freshPositions = [];
+        }
+
+        // Open each listing in this row as a new tab
         const rowTabs = [];
-        for (const url of rowUrls) {
+        for (let j = 0; j < rowListings.length; j++) {
+          const listing = rowListings[j];
+
+          // Find the fresh position for this listing
+          const freshPos = freshPositions.find((p) => p.id === listing.id);
+          const targetX = freshPos ? freshPos.x : 300 + j * 200;
+          const targetY = freshPos ? freshPos.y : 300;
+
+          // Move mouse to this listing (Bezier curve — trusted)
+          if (debuggerTabs.has(searchTabId)) {
+            await trustedMouseMove(searchTabId, targetX, targetY);
+            await sleep(50 + Math.random() * 100);
+          }
+
+          // Open in new tab
           try {
-            const tab = await chrome.tabs.create({ url, active: false });
-            rowTabs.push({ id: tab.id, url });
+            const tab = await chrome.tabs.create({ url: listing.url, active: false });
+            rowTabs.push({ id: tab.id, url: listing.url });
             activeTabs.push(tab.id);
-            // Slight delay between Ctrl+clicks
-            await sleep(60 + Math.random() * 140);
           } catch (e) {}
+
+          // Brief pause between "clicks" (human rhythm)
+          await sleep(80 + Math.random() * 150);
         }
 
         // Wait for all tabs to load in parallel
         if (rowTabs.length > 0) {
-          await waitForAllTabs(
-            rowTabs.map((t) => t.id),
-            15000
-          );
+          await waitForAllTabs(rowTabs.map((t) => t.id), 15000);
         }
 
-        // ---- Visit each tab one by one (like a human clicking through) ----
+        await sleep(200 + Math.random() * 300);
+
+        // ---- Visit each tab one by one ----
         for (let j = 0; j < rowTabs.length; j++) {
           const { id: tabId, url } = rowTabs[j];
           state.listingsChecked++;
 
           try {
-            // Switch to this tab (human clicks on tab)
+            // Switch to this tab (real tab switch)
             await chrome.tabs.update(tabId, { active: true });
-            await sleep(150 + Math.random() * 250);
+            await sleep(100 + Math.random() * 200);
 
             // CAPTCHA check
             if (await hasCaptcha(tabId)) {
-              log(
-                `CAPTCHA on listing after ${state.listingsChecked} checks. Solve it and restart.`
-              );
+              log(`CAPTCHA on listing after ${state.listingsChecked} checks. Solve it and restart.`);
               state.status = "error";
               saveState();
               broadcast();
@@ -535,10 +643,13 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
               return;
             }
 
-            // Browse the listing page naturally
-            await browseListingPage(tabId);
+            // Attach debugger to listing tab for trusted interaction
+            const listingDbg = await attachDebugger(tabId);
+            if (listingDbg) {
+              await quickBrowseListing(tabId);
+            }
 
-            // Check for demand signal
+            // Read demand signal (DOM read only — invisible to detection)
             const result = await checkListingTab(tabId);
 
             if (result) {
@@ -549,22 +660,22 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
                 sold_count: result.soldCount,
               });
               state.productsFound++;
-              log(
-                `MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`
-              );
+              log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
             }
+
+            // Detach debugger before closing
+            await detachDebugger(tabId);
           } catch (e) {}
 
-          // Delay before switching to next tab
-          // Variable: sometimes quick glance, sometimes longer read
-          const browseTime =
+          // Variable delay: 85% quick glance, 15% longer read
+          const glanceTime =
             Math.random() < 0.15
-              ? 800 + Math.random() * 1200 // 15% chance: longer look (2s)
-              : 200 + Math.random() * 400; // 85%: quick scan
-          await sleep(browseTime);
+              ? 600 + Math.random() * 1000
+              : 150 + Math.random() * 300;
+          await sleep(glanceTime);
         }
 
-        // ---- Close all tabs in this row ----
+        // Close all row tabs
         for (const { id: tabId } of rowTabs) {
           await closeTab(tabId);
           activeTabs = activeTabs.filter((t) => t !== tabId);
@@ -579,28 +690,23 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
 
         // Send matches to backend
         if (matchingProducts.length >= 5) {
-          await sendToBackend(
-            keyword,
-            matchingProducts.splice(0),
-            backendUrl
-          );
+          await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
         }
 
-        // Brief pause before next row (human deciding what to click next)
-        await sleep(200 + Math.random() * 500);
+        // Inter-row pause
+        await sleep(150 + Math.random() * 350);
 
-        // Occasional longer distraction pause (~12% of rows)
-        if (Math.random() < 0.12) {
+        // Occasional "distraction" pause (~10% of rows)
+        if (Math.random() < 0.1) {
           await sleep(1500 + Math.random() * 3000);
         }
       }
 
-      // ---- Between search pages ----
+      // Between search pages
       if (page < totalPages) {
-        // Pause before clicking "Next" (human behaviour)
         await sleep(1000 + Math.random() * 2000);
 
-        // Every 5 pages, take a slightly longer break
+        // Longer break every 5 pages
         if (page % 5 === 0) {
           log("Brief break...");
           await sleep(3000 + Math.random() * 5000);
@@ -615,9 +721,7 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
 
     if (!state.cancelled) {
       state.status = "completed";
-      log(
-        `Done! Found ${state.productsFound} trending product(s) across ${state.listingsChecked} listings.`
-      );
+      log(`Done! Found ${state.productsFound} trending product(s) across ${state.listingsChecked} listings.`);
     } else {
       state.status = "cancelled";
     }
@@ -627,9 +731,13 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
   }
 
   // Cleanup
-  for (const tabId of activeTabs) await closeTab(tabId);
+  for (const tabId of activeTabs) {
+    await detachDebugger(tabId);
+    await closeTab(tabId);
+  }
   activeTabs = [];
   if (searchTabId) {
+    await detachDebugger(searchTabId);
     await closeTab(searchTabId);
     searchTabId = null;
   }
@@ -706,9 +814,7 @@ async function pollForQueuedSearches() {
     if (pending.length > 0) {
       const search = pending[0];
       currentQueuedSearchId = search.search_id;
-      await fetch(`${backendUrl}/api/queue/${search.search_id}/claim`, {
-        method: "POST",
-      });
+      await fetch(`${backendUrl}/api/queue/${search.search_id}/claim`, { method: "POST" });
       await runQueuedSearch(search.keyword, search.search_id, backendUrl);
     }
   } catch (e) {}
