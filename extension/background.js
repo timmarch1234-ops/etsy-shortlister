@@ -145,8 +145,9 @@ function connectNative() {
     });
 
     nativePort.onDisconnect.addListener(() => {
-      console.log("[shortlister] Native host disconnected",
-        chrome.runtime.lastError?.message || "");
+      const err = chrome.runtime.lastError?.message || "no error message";
+      console.log("[shortlister] Native host disconnected:", err);
+      if (state) log("Native host disconnected: " + err);
       nativePort = null;
       nativeReady = false;
       // Resolve any pending command so it doesn't hang

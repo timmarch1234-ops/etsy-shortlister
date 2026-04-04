@@ -193,7 +193,18 @@ HANDLERS = {
 
 # ── Main Loop ─────────────────────────────────────────────────
 
+def debug_log(msg):
+    """Write debug info to a file so we can check if Chrome launches us."""
+    try:
+        with open("/tmp/etsy_native_host.log", "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except:
+        pass
+
+
 def main():
+    debug_log("Native host started")
+
     # Graceful shutdown on SIGTERM / broken pipe
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -206,10 +217,14 @@ def main():
             action = msg.get("action", "")
             handler = HANDLERS.get(action)
 
+            debug_log(f"Received: {action}")
+
             if handler:
                 response = handler(msg)
             else:
                 response = {"ok": False, "error": f"Unknown action: {action}"}
+
+            debug_log(f"Responding: {response}")
 
             send_message(response)
 
