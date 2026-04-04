@@ -432,17 +432,37 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
     }
 
     // Create search tab (foreground)
-    const mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
-    searchTabId = mainTab.id;
+    log("Creating search tab...");
+    let mainTab;
+    try {
+      mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
+      searchTabId = mainTab.id;
+      log("Tab created: " + searchTabId);
+    } catch (e) {
+      log("Tab creation failed: " + e.message);
+      throw e;
+    }
 
     // ---- Warm up: visit Etsy homepage ----
-    log("Warming up...");
-    await navigateTab(searchTabId, "https://www.etsy.com");
+    log("Warming up — navigating to Etsy...");
+    try {
+      await navigateTab(searchTabId, "https://www.etsy.com");
+      log("Etsy homepage loaded.");
+    } catch (e) {
+      log("Etsy homepage failed: " + e.message);
+    }
     await sleep(2000 + Math.random() * 2000);
 
     if (nativePort) {
-      await browsePageNaturally(searchTabId);
+      log("Starting mouse simulation on homepage...");
+      try {
+        await browsePageNaturally(searchTabId);
+      } catch (e) {
+        log("Mouse simulation failed: " + e.message);
+      }
       await sleep(1500 + Math.random() * 2500);
+    } else {
+      log("No native port — skipping mouse simulation.");
     }
 
     // ---- Process search pages ----
