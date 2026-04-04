@@ -405,11 +405,21 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
   const startTime = Date.now();
   const TIME_BUDGET_MS = 29 * 60 * 1000;
   const matchingProducts = [];
+  let step = "init";
 
   try {
+    // Global error catcher — saves crash location to storage
+    const saveError = (where, err) => {
+      const msg = `CRASH at [${where}]: ${err?.message || err}`;
+      console.error("[shortlister]", msg);
+      chrome.storage.local.set({ lastError: msg, lastErrorTime: Date.now() });
+      if (state) { log(msg); saveState(); broadcast(); }
+    };
+    step = "start";
     log("Starting search...");
     if (reportProgress) await reportProgress("running");
 
+    step = "native-connect";
     // Connect to native mouse controller
     const nativeConnected = connectNative();
     if (nativePort) {
@@ -431,6 +441,7 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       log("No native mouse host. Continuing without real mouse movement.");
     }
 
+    step = "create-tab";
     // Create search tab (foreground)
     log("Creating search tab...");
     let mainTab;
@@ -443,6 +454,7 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       throw e;
     }
 
+    step = "warmup";
     // ---- Warm up: visit Etsy homepage ----
     log("Warming up — navigating to Etsy...");
     try {
@@ -465,6 +477,7 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       log("No native port — skipping mouse simulation.");
     }
 
+    step = "search-loop";
     // ---- Process search pages ----
     for (let page = 1; page <= totalPages; page++) {
       if (state.cancelled) { log("Search cancelled."); break; }
@@ -691,8 +704,13 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       state.status = "cancelled";
     }
   } catch (e) {
-    state.status = "error";
-    log(`Search failed: ${e.message}`);
+    const errMsg = `Search failed at step [${step}]: ${e.message}\n${e.stack || ""}`;
+    console.error("[shortlister]", errMsg);
+    chrome.storage.local.set({ lastError: errMsg, lastErrorTime: Date.now() });
+    if (state) {
+      state.status = "error";
+      log(`Search failed at [${step}]: ${e.message}`);
+    }
   }
 
   // Cleanup
@@ -758,7 +776,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
   } else if (msg.type === "getState") {
-    sendResponse({ state });
+    chrome.storage.local.get(["lastError", "lastErrorTime"], (data) => {
+      sendResponse({ state, lastError: data.lastError, lastErrorTime: data.lastErrorTime });
+    });
+    return true; // keep channel open for async response
   }
   return true;
 });
