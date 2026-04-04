@@ -2,7 +2,6 @@ const DEFAULT_BACKEND = "https://etsy-shortlister-production-3d4e.up.railway.app
 
 let state = null;
 let searchTabId = null;
-let activeTabs = [];
 let lastMouseX = 400;
 let lastMouseY = 300;
 
@@ -80,62 +79,21 @@ function navigateTab(tabId, url) {
   });
 }
 
-function waitForTabComplete(tabId, timeoutMs = 20000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (!settled) { settled = true; resolve(); }
-    };
-    const timeout = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      done();
-    }, timeoutMs);
-    function listener(id, info) {
-      if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        clearTimeout(timeout);
-        done();
-      }
-    }
-    chrome.tabs.onUpdated.addListener(listener);
-    try {
-      chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError) { done(); return; }
-        if (tab && tab.status === "complete") {
-          chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timeout);
-          done();
-        }
-      });
-    } catch (e) { done(); }
-  });
-}
-
-async function waitForAllTabs(tabIds, timeoutMs = 20000) {
-  await Promise.all(tabIds.map((id) => waitForTabComplete(id, timeoutMs)));
-}
-
 async function closeTab(tabId) {
   try { await chrome.tabs.remove(tabId); } catch (e) {}
 }
 
 // ============================================================
-// NATIVE MESSAGING — Real physical mouse control via pyautogui
-//
-// The Python host receives commands and moves the REAL cursor.
-// Every mouse movement, click, and scroll is a genuine OS event.
-// No anti-bot system can detect this — it IS real human input.
+// NATIVE MESSAGING — Real mouse control via pyautogui
 // ============================================================
 
 let nativePort = null;
-let nativeReady = false;
 let pendingResolve = null;
 
 function connectNative() {
   if (nativePort) return true;
   try {
     nativePort = chrome.runtime.connectNative("com.etsy.shortlister");
-
     nativePort.onMessage.addListener((msg) => {
       if (pendingResolve) {
         const resolve = pendingResolve;
@@ -143,37 +101,24 @@ function connectNative() {
         resolve(msg);
       }
     });
-
     nativePort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError?.message || "no error message";
-      console.log("[shortlister] Native host disconnected:", err);
-      if (state) log("Native host disconnected: " + err);
       nativePort = null;
-      nativeReady = false;
-      // Resolve any pending command so it doesn't hang
       if (pendingResolve) {
         const resolve = pendingResolve;
         pendingResolve = null;
         resolve({ ok: false, error: "disconnected" });
       }
     });
-
-    nativeReady = true;
     return true;
   } catch (e) {
-    console.log("[shortlister] Failed to connect native host:", e.message);
     nativePort = null;
-    nativeReady = false;
     return false;
   }
 }
 
-function sendNativeCommand(command) {
-  return new Promise((resolve, reject) => {
-    if (!nativePort) {
-      resolve({ ok: false, error: "not connected" });
-      return;
-    }
+function sendNative(command) {
+  return new Promise((resolve) => {
+    if (!nativePort) { resolve({ ok: false }); return; }
     pendingResolve = resolve;
     try {
       nativePort.postMessage(command);
@@ -182,27 +127,20 @@ function sendNativeCommand(command) {
       resolve({ ok: false, error: e.message });
       return;
     }
-
-    // Timeout — don't hang if host doesn't respond
     setTimeout(() => {
       if (pendingResolve === resolve) {
         pendingResolve = null;
         resolve({ ok: true, timeout: true });
       }
-    }, 3000);
+    }, 5000);
   });
 }
 
 // ============================================================
 // COORDINATE CALIBRATION
-//
-// The extension knows viewport coordinates (CSS pixels).
-// pyautogui needs screen coordinates. We calibrate by reading
-// window.screenX/Y and the browser chrome height, then the
-// Python host handles the translation for every command.
 // ============================================================
 
-async function calibrateCoordinates(tabId) {
+async function calibrate(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
@@ -214,92 +152,79 @@ async function calibrateCoordinates(tabId) {
       }),
     });
     const info = results[0]?.result;
-    if (info) {
-      await sendNativeCommand({ action: "calibrate", ...info });
+    if (info && nativePort) {
+      await sendNative({ action: "calibrate", ...info });
     }
-  } catch (e) {
-    console.log("[shortlister] Calibration failed:", e.message);
-  }
+  } catch (e) {}
 }
 
 // ============================================================
-// MOUSE / SCROLL / CLICK — via native host (real cursor)
+// MOUSE ACTIONS (via native host if available)
 // ============================================================
 
-async function trustedMouseMove(toX, toY) {
+async function mouseMove(toX, toY) {
+  if (!nativePort) return;
   try {
-    await sendNativeCommand({
+    await sendNative({
       action: "move_bezier",
-      fromX: lastMouseX,
-      fromY: lastMouseY,
-      toX,
-      toY,
+      fromX: lastMouseX, fromY: lastMouseY,
+      toX, toY,
     });
   } catch (e) {}
   lastMouseX = Math.round(toX);
   lastMouseY = Math.round(toY);
 }
 
-async function trustedClick(x, y) {
+async function mouseScroll(deltaY) {
+  if (!nativePort) return;
   try {
-    await sendNativeCommand({ action: "click", x, y, button: "left" });
-  } catch (e) {}
-}
-
-async function trustedScroll(deltaY) {
-  try {
-    await sendNativeCommand({
+    await sendNative({
       action: "scroll",
-      x: lastMouseX,
-      y: lastMouseY,
+      x: lastMouseX, y: lastMouseY,
       deltaY,
     });
   } catch (e) {}
 }
 
-async function idleMouseWander(cx, cy) {
+async function mouseWander(cx, cy) {
+  if (!nativePort) return;
   try {
-    await sendNativeCommand({ action: "wander", x: cx, y: cy });
+    await sendNative({ action: "wander", x: cx, y: cy });
   } catch (e) {}
   lastMouseX = cx;
   lastMouseY = cy;
 }
 
 // ============================================================
-// HUMAN SIMULATION — Composites
+// HUMAN SIMULATION
 // ============================================================
 
-async function browsePageNaturally(tabId) {
-  await calibrateCoordinates(tabId);
-  await idleMouseWander(400 + Math.random() * 300, 300 + Math.random() * 200);
-  await sleep(200 + Math.random() * 400);
+async function browsePageSlowly(tabId) {
+  await calibrate(tabId);
 
-  // Scroll down in a few stages
-  const stages = 2 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < stages; i++) {
-    await trustedScroll(200 + Math.random() * 350);
-    await sleep(400 + Math.random() * 700);
-    if (Math.random() < 0.5) {
-      await trustedMouseMove(
-        200 + Math.random() * 600,
+  // Wander mouse around the page
+  await mouseWander(400 + Math.random() * 400, 250 + Math.random() * 200);
+  await sleep(500 + Math.random() * 800);
+
+  // Scroll down the full page in stages — reading each row
+  const scrollStages = 6 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < scrollStages; i++) {
+    await mouseScroll(250 + Math.random() * 200);
+    await sleep(800 + Math.random() * 1200);
+
+    // Move mouse around between scrolls (reading listings)
+    if (Math.random() < 0.6) {
+      await mouseMove(
+        150 + Math.random() * 800,
         200 + Math.random() * 400
       );
+      await sleep(300 + Math.random() * 600);
     }
   }
 }
 
-async function quickBrowseListing(tabId) {
-  await calibrateCoordinates(tabId);
-  // Move mouse around the listing (title, images, details)
-  await trustedMouseMove(300 + Math.random() * 400, 200 + Math.random() * 200);
-  await sleep(100 + Math.random() * 250);
-  await trustedScroll(150 + Math.random() * 250);
-  await sleep(80 + Math.random() * 180);
-  await trustedMouseMove(200 + Math.random() * 500, 300 + Math.random() * 200);
-}
-
 // ============================================================
-// PAGE ANALYSIS (read-only — no events dispatched)
+// PAGE ANALYSIS
 // ============================================================
 
 async function hasCaptcha(tabId) {
@@ -323,78 +248,87 @@ async function hasCaptcha(tabId) {
   }
 }
 
-async function getListingPositions(tabId) {
+// Extract demand signals directly from search result cards
+// Etsy shows "X bought in past 24 hours" on the cards themselves
+// No need to visit individual listing pages
+async function extractFromSearchPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
+      const products = [];
+      const seenIds = new Set();
+      const allText = document.body?.innerText || "";
+
+      // Find all listing links
       const links = document.querySelectorAll('a[href*="/listing/"]');
-      const seen = new Set();
-      const listings = [];
-      links.forEach((a) => {
-        const m = a.href.match(/\/listing\/(\d+)/);
-        if (m && !seen.has(m[1])) {
-          seen.add(m[1]);
-          const rect = a.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            listings.push({
-              url: `https://www.etsy.com/listing/${m[1]}`,
-              x: rect.left + rect.width * (0.3 + Math.random() * 0.4),
-              y: rect.top + rect.height * (0.3 + Math.random() * 0.4),
-              id: m[1],
-            });
+
+      for (const link of links) {
+        const hrefMatch = link.href.match(/\/listing\/(\d+)/);
+        if (!hrefMatch || seenIds.has(hrefMatch[1])) continue;
+        seenIds.add(hrefMatch[1]);
+
+        // Walk up to find the listing card container
+        let card = link.closest('[data-listing-id]') ||
+                   link.closest('.v2-listing-card') ||
+                   link.closest('.wt-grid__item-xs-6') ||
+                   link.closest('[class*="listing"]');
+        if (!card) {
+          let el = link;
+          for (let i = 0; i < 8; i++) {
+            if (el.parentElement) el = el.parentElement;
+            if (el.offsetHeight > 150 && el.offsetWidth > 100) {
+              card = el;
+              break;
+            }
           }
         }
-      });
-      return listings;
-    },
-  });
-  return results[0]?.result || [];
-}
+        if (!card) card = link.parentElement?.parentElement || link.parentElement;
 
-async function checkListingTab(tabId) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const bodyText = document.body?.innerText || "";
-        const soldMatch = bodyText.match(
+        const cardText = card?.innerText || "";
+
+        // Match "X bought/sold in past 24 hours"
+        const soldMatch = cardText.match(
           /(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
         );
-        if (!soldMatch) return null;
-        const soldCount = soldMatch[0].trim();
-        const title = document.title?.split(" - Etsy")[0]?.trim() || "";
-        const ogImg = document.querySelector('meta[property="og:image"]');
-        const imageUrl = ogImg?.content || "";
-        return { soldCount, title, imageUrl };
-      },
-    });
-    return results[0]?.result || null;
-  } catch (e) {
-    return null;
-  }
+
+        if (soldMatch) {
+          // Get title
+          const titleEl = card?.querySelector('h3, h2, [class*="title"]') || link;
+          const title = titleEl?.textContent?.trim()?.substring(0, 120) || "";
+
+          // Get image
+          const img = card?.querySelector("img");
+          const imageUrl = img?.src || "";
+
+          const listingUrl = `https://www.etsy.com/listing/${hrefMatch[1]}`;
+
+          products.push({
+            title,
+            url: listingUrl,
+            image_url: imageUrl,
+            sold_count: soldMatch[0].trim(),
+          });
+        }
+      }
+
+      return { products, totalListings: seenIds.size };
+    },
+  });
+  return results[0]?.result || { products: [], totalListings: 0 };
 }
 
 // ============================================================
-// MAIN SEARCH — Row-by-row with REAL mouse movement
+// MAIN SEARCH
 //
-// The physical cursor moves across the screen exactly like a
-// human browsing Etsy. pyautogui controls the real OS cursor
-// with Bezier curves, micro-jitter, and variable speed.
+// Only loads 20 search result pages — NOT individual listings.
+// Etsy shows "X bought in past 24 hours" directly on the
+// search result cards. We scroll through each page with real
+// mouse movement and extract the signals from the cards.
 //
-// Flow for each search page:
-// 1. Navigate to search page
-// 2. Browse naturally (real mouse wander + real scroll)
-// 3. Scroll back to top
-// 4. For each row of ~4 listings:
-//    a. Move real cursor to each listing, linger briefly
-//    b. Open listing in new tab
-//    c. Switch to tab, browse it (real mouse + scroll)
-//    d. Check for demand signal (DOM read only)
-//    e. Close tab, back to search page
-//    f. Scroll down to next row
+// 20 page loads total = zero ban risk
+// ~15-20 minutes with generous delays
+// Real mouse movement via pyautogui makes it look fully human
 // ============================================================
-
-const ROW_SIZE = 4;
 
 async function runMainSearch(keyword, backendUrl, reportProgress) {
   const totalPages = 20;
@@ -402,92 +336,51 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
   saveState();
   broadcast();
 
-  const startTime = Date.now();
-  const TIME_BUDGET_MS = 29 * 60 * 1000;
   const matchingProducts = [];
-  let step = "init";
 
   try {
-    // Global error catcher — saves crash location to storage
-    const saveError = (where, err) => {
-      const msg = `CRASH at [${where}]: ${err?.message || err}`;
-      console.error("[shortlister]", msg);
-      chrome.storage.local.set({ lastError: msg, lastErrorTime: Date.now() });
-      if (state) { log(msg); saveState(); broadcast(); }
-    };
-    step = "start";
     log("Starting search...");
     if (reportProgress) await reportProgress("running");
 
-    step = "native-connect";
-    // Connect to native mouse controller
-    const nativeConnected = connectNative();
+    // Connect native mouse host
+    connectNative();
     if (nativePort) {
-      try {
-        const pong = await sendNativeCommand({ action: "ping" });
-        if (pong?.ok && !pong.error) {
-          log("Real mouse control active.");
-        } else {
-          log("Native host not responding. Continuing without real mouse.");
-          nativePort = null;
-          nativeReady = false;
-        }
-      } catch (e) {
-        log("Native host error. Continuing without real mouse.");
+      const pong = await sendNative({ action: "ping" });
+      if (pong?.ok && !pong.error) {
+        log("Real mouse control active.");
+      } else {
+        log("Mouse host not responding — continuing without.");
         nativePort = null;
-        nativeReady = false;
       }
     } else {
-      log("No native mouse host. Continuing without real mouse movement.");
+      log("No mouse host — continuing without real mouse.");
     }
 
-    step = "create-tab";
-    // Create search tab (foreground)
-    log("Creating search tab...");
-    let mainTab;
-    try {
-      mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
-      searchTabId = mainTab.id;
-      log("Tab created: " + searchTabId);
-    } catch (e) {
-      log("Tab creation failed: " + e.message);
-      throw e;
-    }
+    // Create search tab
+    const mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
+    searchTabId = mainTab.id;
 
-    step = "warmup";
-    // ---- Warm up: visit Etsy homepage ----
-    log("Warming up — navigating to Etsy...");
+    // Warm up — visit Etsy homepage
+    log("Visiting Etsy homepage...");
     try {
       await navigateTab(searchTabId, "https://www.etsy.com");
-      log("Etsy homepage loaded.");
-    } catch (e) {
-      log("Etsy homepage failed: " + e.message);
-    }
-    await sleep(2000 + Math.random() * 2000);
-
-    if (nativePort) {
-      log("Starting mouse simulation on homepage...");
-      try {
-        await browsePageNaturally(searchTabId);
-      } catch (e) {
-        log("Mouse simulation failed: " + e.message);
+      await sleep(3000 + Math.random() * 3000);
+      if (nativePort) {
+        await browsePageSlowly(searchTabId);
       }
-      await sleep(1500 + Math.random() * 2500);
-    } else {
-      log("No native port — skipping mouse simulation.");
+      await sleep(2000 + Math.random() * 3000);
+    } catch (e) {
+      log("Homepage warm-up issue: " + e.message);
     }
 
-    step = "search-loop";
-    // ---- Process search pages ----
+    // ---- Scan each search results page ----
+    let totalListingsScanned = 0;
+
     for (let page = 1; page <= totalPages; page++) {
       if (state.cancelled) { log("Search cancelled."); break; }
-      if (Date.now() - startTime > TIME_BUDGET_MS) {
-        log(`Time limit reached at page ${page}.`);
-        break;
-      }
 
       state.currentPage = page;
-      log(`Searching page ${page} of ${totalPages}...`);
+      log(`Scanning page ${page} of ${totalPages}...`);
       broadcast();
       if (reportProgress) await reportProgress("running");
 
@@ -495,199 +388,94 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
       const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(keyword)}&ref=search_bar&page=${page}`;
       try {
         await navigateTab(searchTabId, searchUrl);
-        await sleep(1500 + Math.random() * 1500);
+        await sleep(2000 + Math.random() * 2000);
       } catch (e) {
-        log(`Page ${page}: Failed to load, skipping.`);
+        log(`Page ${page}: Failed to load — ${e.message}`);
         continue;
       }
 
       // CAPTCHA check
       if (await hasCaptcha(searchTabId)) {
-        log("Access restricted! Waiting for it to clear...");
+        log("Access restricted! Please wait, then restart search.");
         state.status = "error";
         saveState();
         broadcast();
-        chrome.tabs.update(searchTabId, { active: true });
+        try { chrome.tabs.update(searchTabId, { active: true }); } catch (e) {}
         if (reportProgress) await reportProgress("error");
         return;
       }
 
-      // Browse search page naturally with real mouse
+      // Browse the search page naturally with real mouse
+      // This scrolls through the entire page, reading every row
       if (nativePort) {
-        await browsePageNaturally(searchTabId);
-        await sleep(300 + Math.random() * 500);
-
-        // Scroll back to top
-        await trustedScroll(-3000);
-        await sleep(400 + Math.random() * 400);
+        await browsePageSlowly(searchTabId);
       }
+      await sleep(1000 + Math.random() * 1500);
 
-      // Get all listing positions
-      let listings;
+      // Scroll back to top so we can get all card positions
       try {
-        listings = await getListingPositions(searchTabId);
+        await chrome.scripting.executeScript({
+          target: { tabId: searchTabId },
+          func: () => window.scrollTo(0, 0),
+        });
+      } catch (e) {}
+      await sleep(500);
+
+      // Now scroll through the entire page to make sure lazy content loads
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: searchTabId },
+          func: async () => {
+            for (let i = 0; i < 10; i++) {
+              window.scrollBy(0, 500);
+              await new Promise(r => setTimeout(r, 300));
+            }
+            // Back to top
+            window.scrollTo(0, 0);
+          },
+        });
+      } catch (e) {}
+      await sleep(1000);
+
+      // Extract demand signals from search cards
+      let pageResults;
+      try {
+        pageResults = await extractFromSearchPage(searchTabId);
       } catch (e) {
-        log(`Page ${page}: Failed to get listings.`);
+        log(`Page ${page}: Failed to extract — ${e.message}`);
         continue;
       }
 
-      if (listings.length === 0) {
-        log(`Page ${page}: No listings found.`);
-        continue;
-      }
+      totalListingsScanned += pageResults.totalListings;
+      state.listingsChecked = totalListingsScanned;
 
-      log(`Page ${page}: ${listings.length} listings in ${Math.ceil(listings.length / ROW_SIZE)} rows.`);
-
-      // Dynamic pacing
-      const timeLeft = TIME_BUDGET_MS - (Date.now() - startTime);
-      const listingsLeft = listings.length + Math.max(0, totalPages - page) * 50;
-      const msPerListing = Math.max(500, timeLeft / Math.max(1, listingsLeft));
-
-      // ---- Row by row ----
-      for (let rowStart = 0; rowStart < listings.length; rowStart += ROW_SIZE) {
-        if (state.cancelled) break;
-        if (Date.now() - startTime > TIME_BUDGET_MS) break;
-
-        const rowEnd = Math.min(rowStart + ROW_SIZE, listings.length);
-        const rowListings = listings.slice(rowStart, rowEnd);
-
-        // Scroll to next row on search page
-        if (rowStart > 0 && nativePort) {
-          await chrome.tabs.update(searchTabId, { active: true });
-          await sleep(100 + Math.random() * 150);
-          await calibrateCoordinates(searchTabId);
-          await trustedScroll(300 + Math.random() * 80);
-          await sleep(250 + Math.random() * 350);
-        }
-
-        // Re-read positions after scroll
-        let freshPositions;
-        try {
-          freshPositions = await getListingPositions(searchTabId);
-        } catch (e) {
-          freshPositions = [];
-        }
-        if (nativePort) {
-          await calibrateCoordinates(searchTabId);
-        }
-
-        // Move mouse to each listing in the row, then open it
-        const rowTabs = [];
-        for (let j = 0; j < rowListings.length; j++) {
-          const listing = rowListings[j];
-          const freshPos = freshPositions.find((p) => p.id === listing.id);
-          const targetX = freshPos ? freshPos.x : 200 + j * 220;
-          const targetY = freshPos ? freshPos.y : 350;
-
-          // Move real cursor to this listing (hover over it)
-          if (nativePort) {
-            await trustedMouseMove(targetX, targetY);
-            await sleep(40 + Math.random() * 100);
-          }
-
-          // Open in new tab
-          try {
-            const tab = await chrome.tabs.create({ url: listing.url, active: false });
-            rowTabs.push({ id: tab.id, url: listing.url });
-            activeTabs.push(tab.id);
-          } catch (e) {}
-
-          await sleep(60 + Math.random() * 120);
-        }
-
-        // Wait for all tabs to load in parallel
-        if (rowTabs.length > 0) {
-          await waitForAllTabs(rowTabs.map((t) => t.id), 15000);
-        }
-        await sleep(150 + Math.random() * 250);
-
-        // ---- Visit each tab one by one ----
-        for (let j = 0; j < rowTabs.length; j++) {
-          const { id: tabId, url } = rowTabs[j];
-          state.listingsChecked++;
-
-          try {
-            // Switch to this tab
-            await chrome.tabs.update(tabId, { active: true });
-            await sleep(100 + Math.random() * 150);
-
-            // CAPTCHA check
-            if (await hasCaptcha(tabId)) {
-              log(`Access restricted after ${state.listingsChecked} listings.`);
-              state.status = "error";
-              saveState();
-              broadcast();
-              if (reportProgress) await reportProgress("error");
-              for (const bt of rowTabs) {
-                if (bt.id !== tabId) await closeTab(bt.id);
-              }
-              activeTabs = activeTabs.filter(
-                (t) => !rowTabs.map((b) => b.id).includes(t)
-              );
-              return;
-            }
-
-            // Browse listing with real mouse
-            if (nativePort) {
-              await quickBrowseListing(tabId);
-            }
-
-            // Read demand signal (DOM only — invisible)
-            const result = await checkListingTab(tabId);
-
-            if (result) {
-              matchingProducts.push({
-                title: result.title,
-                url,
-                image_url: result.imageUrl,
-                sold_count: result.soldCount,
-              });
-              state.productsFound++;
-              log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
-            }
-          } catch (e) {}
-
-          // Variable dwell: 85% quick glance, 15% longer read
-          const dwell =
-            Math.random() < 0.15
-              ? 500 + Math.random() * 900
-              : 120 + Math.random() * 280;
-          await sleep(dwell);
-        }
-
-        // Close all row tabs
-        for (const { id: tabId } of rowTabs) {
-          await closeTab(tabId);
-          activeTabs = activeTabs.filter((t) => t !== tabId);
-        }
-
-        // Switch back to search tab
-        try {
-          await chrome.tabs.update(searchTabId, { active: true });
-        } catch (e) {}
-
-        broadcast();
-
-        // Send matches to backend
-        if (matchingProducts.length >= 5) {
-          await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-        }
-
-        // Inter-row pause
-        await sleep(150 + Math.random() * 300);
-
-        // Occasional distraction pause (~10%)
-        if (Math.random() < 0.1) {
-          await sleep(1200 + Math.random() * 2500);
+      if (pageResults.products.length > 0) {
+        for (const product of pageResults.products) {
+          matchingProducts.push(product);
+          state.productsFound++;
+          log(`FOUND: ${product.sold_count} — ${product.title.substring(0, 60)}`);
         }
       }
 
-      // Between search pages
+      log(`Page ${page}: ${pageResults.totalListings} listings scanned, ${pageResults.products.length} with demand signals.`);
+      broadcast();
+
+      // Send matches to backend in batches
+      if (matchingProducts.length >= 5) {
+        await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
+      }
+
+      // Generous delay between pages — we only have 20 to do
       if (page < totalPages) {
-        await sleep(800 + Math.random() * 1500);
+        const delay = 15000 + Math.random() * 25000; // 15-40 seconds
+        log(`Waiting before next page...`);
+        await sleep(delay);
+
+        // Extra break every 5 pages
         if (page % 5 === 0) {
-          log("Brief break...");
-          await sleep(2500 + Math.random() * 4000);
+          const breakTime = 20000 + Math.random() * 20000; // 20-40 seconds
+          log("Taking a longer break...");
+          await sleep(breakTime);
         }
       }
     }
@@ -699,37 +487,32 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
 
     if (!state.cancelled) {
       state.status = "completed";
-      log(`Done! Found ${state.productsFound} trending product(s) across ${state.listingsChecked} listings.`);
+      log(`Done! Found ${state.productsFound} trending product(s) across ${totalListingsScanned} listings scanned.`);
     } else {
       state.status = "cancelled";
     }
   } catch (e) {
-    const errMsg = `Search failed at step [${step}]: ${e.message}\n${e.stack || ""}`;
-    console.error("[shortlister]", errMsg);
-    chrome.storage.local.set({ lastError: errMsg, lastErrorTime: Date.now() });
+    console.error("[shortlister] Search crash:", e);
+    chrome.storage.local.set({ lastError: e.message, lastErrorStack: e.stack });
     if (state) {
       state.status = "error";
-      log(`Search failed at [${step}]: ${e.message}`);
+      log(`Search failed: ${e.message}`);
     }
   }
 
   // Cleanup
-  for (const tabId of activeTabs) await closeTab(tabId);
-  activeTabs = [];
   if (searchTabId) {
     await closeTab(searchTabId);
     searchTabId = null;
   }
-  // Disconnect native host
   if (nativePort) {
     try { nativePort.disconnect(); } catch (e) {}
     nativePort = null;
-    nativeReady = false;
   }
 
   saveState();
   broadcast();
-  if (reportProgress) await reportProgress(state.status);
+  if (reportProgress) await reportProgress(state?.status || "error");
 }
 
 // ============================================================
@@ -776,10 +559,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
   } else if (msg.type === "getState") {
-    chrome.storage.local.get(["lastError", "lastErrorTime"], (data) => {
-      sendResponse({ state, lastError: data.lastError, lastErrorTime: data.lastErrorTime });
-    });
-    return true; // keep channel open for async response
+    sendResponse({ state });
   }
   return true;
 });
