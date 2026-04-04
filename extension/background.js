@@ -38,20 +38,15 @@ function broadcast() {
   });
 }
 
-// Human-like random delay: generates a delay that mimics real browsing
-// Short delays (3-8s) for quick glances, longer delays (8-20s) for "reading"
+// Delay between listing visits (page load itself adds ~1-2s)
+// Target: ~1200 listings in 25-30 min = ~1.3s per listing including load
 function humanDelay() {
-  // 70% chance of short delay, 30% chance of longer "reading" delay
-  if (Math.random() < 0.7) {
-    return 3000 + Math.random() * 5000; // 3-8 seconds
-  } else {
-    return 8000 + Math.random() * 12000; // 8-20 seconds
-  }
+  return 200 + Math.random() * 500; // 0.2-0.7 seconds
 }
 
-// Delay between search pages (longer, like a human browsing)
+// Delay between search pages
 function pageDelay() {
-  return 10000 + Math.random() * 15000; // 10-25 seconds
+  return 1500 + Math.random() * 1500; // 1.5-3 seconds
 }
 
 async function sleep(ms) {
@@ -179,15 +174,6 @@ async function checkListingPage(tabId) {
   return results[0]?.result || null;
 }
 
-// Shuffle array (Fisher-Yates) to randomize visit order
-function shuffle(arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
 async function runSearch(keyword, backendUrl) {
   const totalPages = 20;
   state = defaultState(keyword, totalPages);
@@ -261,10 +247,7 @@ async function runSearch(keyword, backendUrl) {
 
       if (listingUrls.length === 0 && page > 1) continue;
 
-      // Shuffle to randomize visit order (bots go in order, humans don't)
-      shuffle(listingUrls);
-
-      // Visit each listing
+      // Visit each listing top to bottom
       for (let i = 0; i < listingUrls.length; i++) {
         if (state.cancelled) break;
 
@@ -277,7 +260,7 @@ async function runSearch(keyword, backendUrl) {
         try {
           await navigateTab(searchTabId, listingUrl);
           // Wait for page to render
-          await sleep(1500 + Math.random() * 2000);
+          await sleep(500 + Math.random() * 500);
 
           // Check for CAPTCHA mid-search
           try {
@@ -317,13 +300,6 @@ async function runSearch(keyword, backendUrl) {
         }
 
         broadcast();
-
-        // Every ~15 listings, take a longer break (like a human getting distracted)
-        if (i > 0 && i % 15 === 0) {
-          const breakTime = 15000 + Math.random() * 20000; // 15-35 second break
-          log(`Brief pause...`);
-          await sleep(breakTime);
-        }
       }
 
       // Longer delay between search pages
