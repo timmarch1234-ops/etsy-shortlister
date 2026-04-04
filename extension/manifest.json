@@ -3,7 +3,7 @@
   "name": "Etsy Product Shortlister",
   "version": "2.0.0",
   "description": "Find trending Etsy products bought in the past 24 hours",
-  "permissions": ["storage", "scripting", "tabs", "debugger"],
+  "permissions": ["storage", "scripting", "tabs", "nativeMessaging"],
   "host_permissions": [
     "https://www.etsy.com/*",
     "https://etsy-shortlister-production-3d4e.up.railway.app/*",

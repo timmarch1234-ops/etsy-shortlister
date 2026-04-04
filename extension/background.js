@@ -120,223 +120,176 @@ async function closeTab(tabId) {
 }
 
 // ============================================================
-// CHROME DEVTOOLS PROTOCOL — TRUSTED INPUT EVENTS
+// NATIVE MESSAGING — Real physical mouse control via pyautogui
 //
-// chrome.debugger dispatches events via CDP, producing
-// isTrusted: true events. DataDome cannot distinguish these
-// from real human input. This is the same mechanism that
-// Puppeteer and Playwright use under the hood.
+// The Python host receives commands and moves the REAL cursor.
+// Every mouse movement, click, and scroll is a genuine OS event.
+// No anti-bot system can detect this — it IS real human input.
 // ============================================================
 
-const debuggerTabs = new Set();
+let nativePort = null;
+let nativeReady = false;
+let pendingResolve = null;
 
-async function attachDebugger(tabId) {
-  if (debuggerTabs.has(tabId)) return true;
+function connectNative() {
+  if (nativePort) return;
   try {
-    await new Promise((resolve, reject) => {
-      chrome.debugger.attach({ tabId }, "1.3", () => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve();
-        }
-      });
+    nativePort = chrome.runtime.connectNative("com.etsy.shortlister");
+
+    nativePort.onMessage.addListener((msg) => {
+      if (pendingResolve) {
+        const resolve = pendingResolve;
+        pendingResolve = null;
+        resolve(msg);
+      }
     });
-    debuggerTabs.add(tabId);
-    return true;
+
+    nativePort.onDisconnect.addListener(() => {
+      console.log("[shortlister] Native host disconnected",
+        chrome.runtime.lastError?.message || "");
+      nativePort = null;
+      nativeReady = false;
+      pendingResolve = null;
+    });
+
+    nativeReady = true;
   } catch (e) {
-    console.log("Debugger attach failed:", e.message);
-    return false;
+    console.log("[shortlister] Failed to connect native host:", e.message);
+    nativePort = null;
+    nativeReady = false;
   }
 }
 
-async function detachDebugger(tabId) {
-  if (!debuggerTabs.has(tabId)) return;
-  try {
-    await new Promise((resolve) => {
-      chrome.debugger.detach({ tabId }, () => {
-        resolve();
-      });
-    });
-  } catch (e) {}
-  debuggerTabs.delete(tabId);
-}
-
-// Handle debugger detach (user dismissed the bar, tab closed, etc.)
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) debuggerTabs.delete(source.tabId);
-});
-
-async function cdpSend(tabId, method, params = {}) {
+function sendNativeCommand(command) {
   return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(result);
+    if (!nativePort) {
+      connectNative();
+    }
+    if (!nativePort) {
+      reject(new Error("Native host not available"));
+      return;
+    }
+    pendingResolve = resolve;
+    try {
+      nativePort.postMessage(command);
+    } catch (e) {
+      pendingResolve = null;
+      reject(e);
+    }
+
+    // Timeout for long operations (Bezier movement can take ~500ms)
+    setTimeout(() => {
+      if (pendingResolve === resolve) {
+        pendingResolve = null;
+        resolve({ ok: true, timeout: true });
       }
-    });
+    }, 5000);
   });
 }
 
 // ============================================================
-// TRUSTED MOUSE MOVEMENT — Bezier curves via CDP
+// COORDINATE CALIBRATION
 //
-// Generates isTrusted:true mousemove events along a smooth
-// cubic Bezier path with micro-jitter (hand tremor) and
-// variable speed (slower at start/end, faster in middle).
+// The extension knows viewport coordinates (CSS pixels).
+// pyautogui needs screen coordinates. We calibrate by reading
+// window.screenX/Y and the browser chrome height, then the
+// Python host handles the translation for every command.
 // ============================================================
 
-async function trustedMouseMove(tabId, toX, toY) {
-  const fromX = lastMouseX;
-  const fromY = lastMouseY;
-  const dist = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
-  const steps = Math.max(8, Math.min(25, Math.round(dist / 15)));
-
-  // Bezier control points — random curves, not straight lines
-  const cp1x = fromX + (toX - fromX) * 0.25 + (Math.random() - 0.5) * 80;
-  const cp1y = fromY + (toY - fromY) * 0.25 + (Math.random() - 0.5) * 60;
-  const cp2x = fromX + (toX - fromX) * 0.75 + (Math.random() - 0.5) * 80;
-  const cp2y = fromY + (toY - fromY) * 0.75 + (Math.random() - 0.5) * 60;
-
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const u = 1 - t;
-    // Cubic Bezier + micro-jitter
-    const x =
-      u * u * u * fromX +
-      3 * u * u * t * cp1x +
-      3 * u * t * t * cp2x +
-      t * t * t * toX +
-      (Math.random() - 0.5) * 2;
-    const y =
-      u * u * u * fromY +
-      3 * u * u * t * cp1y +
-      3 * u * t * t * cp2y +
-      t * t * t * toY +
-      (Math.random() - 0.5) * 2;
-
-    try {
-      await cdpSend(tabId, "Input.dispatchMouseEvent", {
-        type: "mouseMoved",
-        x: Math.round(x),
-        y: Math.round(y),
-      });
-    } catch (e) { break; }
-
-    // Easing: slower at start/end, faster in middle
-    const speed = 8 + Math.sin(t * Math.PI) * 18 + Math.random() * 10;
-    await sleep(speed);
+async function calibrateCoordinates(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        screenX: window.screenX,
+        screenY: window.screenY,
+        chromeOffsetY: window.outerHeight - window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+      }),
+    });
+    const info = results[0]?.result;
+    if (info) {
+      await sendNativeCommand({ action: "calibrate", ...info });
+    }
+  } catch (e) {
+    console.log("[shortlister] Calibration failed:", e.message);
   }
+}
 
+// ============================================================
+// MOUSE / SCROLL / CLICK — via native host (real cursor)
+// ============================================================
+
+async function trustedMouseMove(toX, toY) {
+  try {
+    await sendNativeCommand({
+      action: "move_bezier",
+      fromX: lastMouseX,
+      fromY: lastMouseY,
+      toX,
+      toY,
+    });
+  } catch (e) {}
   lastMouseX = Math.round(toX);
   lastMouseY = Math.round(toY);
 }
 
-// Trusted click at current mouse position
-async function trustedClick(tabId, x, y) {
+async function trustedClick(x, y) {
   try {
-    await cdpSend(tabId, "Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x: Math.round(x),
-      y: Math.round(y),
-      button: "left",
-      clickCount: 1,
-    });
-    await sleep(40 + Math.random() * 60);
-    await cdpSend(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x: Math.round(x),
-      y: Math.round(y),
-      button: "left",
-      clickCount: 1,
+    await sendNativeCommand({ action: "click", x, y, button: "left" });
+  } catch (e) {}
+}
+
+async function trustedScroll(deltaY) {
+  try {
+    await sendNativeCommand({
+      action: "scroll",
+      x: lastMouseX,
+      y: lastMouseY,
+      deltaY,
     });
   } catch (e) {}
 }
 
-// Trusted scroll via mouseWheel event
-async function trustedScroll(tabId, deltaY) {
-  // Scroll in 2-4 increments (humans don't scroll in one jump)
-  const scrollSteps = 2 + Math.floor(Math.random() * 3);
-  const perStep = deltaY / scrollSteps;
-
-  for (let i = 0; i < scrollSteps; i++) {
-    const jitter = (Math.random() - 0.5) * 30;
-    try {
-      await cdpSend(tabId, "Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x: lastMouseX,
-        y: lastMouseY,
-        deltaX: 0,
-        deltaY: Math.round(perStep + jitter),
-      });
-    } catch (e) { break; }
-    await sleep(100 + Math.random() * 200);
-  }
-}
-
-// Trusted keyboard press
-async function trustedKeyPress(tabId, key, code, keyCode) {
+async function idleMouseWander(cx, cy) {
   try {
-    await cdpSend(tabId, "Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key,
-      code,
-      windowsVirtualKeyCode: keyCode,
-      nativeVirtualKeyCode: keyCode,
-    });
-    await sleep(30 + Math.random() * 60);
-    await cdpSend(tabId, "Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key,
-      code,
-      windowsVirtualKeyCode: keyCode,
-      nativeVirtualKeyCode: keyCode,
-    });
+    await sendNativeCommand({ action: "wander", x: cx, y: cy });
   } catch (e) {}
+  lastMouseX = cx;
+  lastMouseY = cy;
 }
 
 // ============================================================
 // HUMAN SIMULATION — Composites
 // ============================================================
 
-// Casually move mouse around the page (idle browsing)
-async function idleMouseWander(tabId) {
-  const moves = 2 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < moves; i++) {
-    const x = 100 + Math.random() * 900;
-    const y = 100 + Math.random() * 500;
-    await trustedMouseMove(tabId, x, y);
-    await sleep(200 + Math.random() * 600);
-  }
-}
-
-// Browse a page naturally: mouse wander + scroll down + more mouse
 async function browsePageNaturally(tabId) {
-  await idleMouseWander(tabId);
-  await sleep(300 + Math.random() * 500);
+  await calibrateCoordinates(tabId);
+  await idleMouseWander(400 + Math.random() * 300, 300 + Math.random() * 200);
+  await sleep(200 + Math.random() * 400);
 
   // Scroll down in a few stages
-  const scrollStages = 2 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < scrollStages; i++) {
-    await trustedScroll(tabId, 200 + Math.random() * 400);
-    await sleep(400 + Math.random() * 800);
-    // Occasional mouse wander between scrolls
+  const stages = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < stages; i++) {
+    await trustedScroll(200 + Math.random() * 350);
+    await sleep(400 + Math.random() * 700);
     if (Math.random() < 0.5) {
-      await idleMouseWander(tabId);
+      await trustedMouseMove(
+        200 + Math.random() * 600,
+        200 + Math.random() * 400
+      );
     }
   }
 }
 
-// Quick browse on a listing tab (glance + small scroll)
 async function quickBrowseListing(tabId) {
-  // Move mouse around the listing (title, image, details area)
-  await trustedMouseMove(tabId, 300 + Math.random() * 400, 200 + Math.random() * 200);
-  await sleep(150 + Math.random() * 300);
-  await trustedScroll(tabId, 150 + Math.random() * 300);
-  await sleep(100 + Math.random() * 200);
-  // One more mouse move (scanning the page)
-  await trustedMouseMove(tabId, 200 + Math.random() * 600, 300 + Math.random() * 300);
+  await calibrateCoordinates(tabId);
+  // Move mouse around the listing (title, images, details)
+  await trustedMouseMove(300 + Math.random() * 400, 200 + Math.random() * 200);
+  await sleep(100 + Math.random() * 250);
+  await trustedScroll(150 + Math.random() * 250);
+  await sleep(80 + Math.random() * 180);
+  await trustedMouseMove(200 + Math.random() * 500, 300 + Math.random() * 200);
 }
 
 // ============================================================
@@ -364,7 +317,6 @@ async function hasCaptcha(tabId) {
   }
 }
 
-// Get positions and URLs of all listing links (top-to-bottom order)
 async function getListingPositions(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
@@ -377,7 +329,6 @@ async function getListingPositions(tabId) {
         if (m && !seen.has(m[1])) {
           seen.add(m[1]);
           const rect = a.getBoundingClientRect();
-          // Only include links that are visible and have a size
           if (rect.width > 0 && rect.height > 0) {
             listings.push({
               url: `https://www.etsy.com/listing/${m[1]}`,
@@ -394,7 +345,6 @@ async function getListingPositions(tabId) {
   return results[0]?.result || [];
 }
 
-// Check listing page for "sold/bought in past 24 hours"
 async function checkListingTab(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
@@ -419,25 +369,23 @@ async function checkListingTab(tabId) {
 }
 
 // ============================================================
-// MAIN SEARCH — Row-by-row with trusted CDP events
+// MAIN SEARCH — Row-by-row with REAL mouse movement
 //
-// How a real person browses Etsy:
-// 1. Search page loads, they read/scan the results
-// 2. They see a row of ~4 items, mouse moves to one, click
-//    to open in new tab, then next one, etc.
-// 3. They switch to each tab, glance at it, close it
-// 4. Back on search page, scroll down to next row
-// 5. Repeat
+// The physical cursor moves across the screen exactly like a
+// human browsing Etsy. pyautogui controls the real OS cursor
+// with Bezier curves, micro-jitter, and variable speed.
 //
-// Our approach:
-// - chrome.debugger (CDP) for ALL mouse/scroll/keyboard input
-//   → every event is isTrusted:true, indistinguishable from human
-// - chrome.scripting.executeScript ONLY for reading the DOM
-//   (invisible to detection — no events dispatched)
-// - Bezier curve mouse paths with micro-jitter and variable speed
-// - Trusted scroll wheel events in natural increments
-// - Real tab switching with human-like timing
-// - Dynamic pacing to fit within time budget
+// Flow for each search page:
+// 1. Navigate to search page
+// 2. Browse naturally (real mouse wander + real scroll)
+// 3. Scroll back to top
+// 4. For each row of ~4 listings:
+//    a. Move real cursor to each listing, linger briefly
+//    b. Open listing in new tab
+//    c. Switch to tab, browse it (real mouse + scroll)
+//    d. Check for demand signal (DOM read only)
+//    e. Close tab, back to search page
+//    f. Scroll down to next row
 // ============================================================
 
 const ROW_SIZE = 4;
@@ -456,6 +404,19 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
     log("Starting search...");
     if (reportProgress) await reportProgress("running");
 
+    // Connect to native mouse controller
+    connectNative();
+    if (!nativePort) {
+      log("WARNING: Native mouse host not connected. Run install.sh first.");
+      log("Continuing without real mouse movement...");
+    } else {
+      // Ping to verify connection
+      const pong = await sendNativeCommand({ action: "ping" });
+      if (pong?.ok) {
+        log("Real mouse control active.");
+      }
+    }
+
     // Create search tab (foreground)
     const mainTab = await chrome.tabs.create({ url: "about:blank", active: true });
     searchTabId = mainTab.id;
@@ -465,14 +426,7 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
     await navigateTab(searchTabId, "https://www.etsy.com");
     await sleep(2000 + Math.random() * 2000);
 
-    // Attach debugger to search tab for trusted events
-    const dbgOk = await attachDebugger(searchTabId);
-    if (!dbgOk) {
-      log("Could not attach debugger. Search may be less stealthy.");
-    }
-
-    // Browse homepage naturally (trusted mouse + scroll)
-    if (dbgOk) {
+    if (nativePort) {
       await browsePageNaturally(searchTabId);
       await sleep(1500 + Math.random() * 2500);
     }
@@ -500,12 +454,9 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         continue;
       }
 
-      // Re-attach debugger if needed (navigations can detach it)
-      await attachDebugger(searchTabId);
-
       // CAPTCHA check
       if (await hasCaptcha(searchTabId)) {
-        log("CAPTCHA detected! Solve it in the Etsy tab, then restart.");
+        log("Access restricted! Waiting for it to clear...");
         state.status = "error";
         saveState();
         broadcast();
@@ -514,21 +465,15 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         return;
       }
 
-      // Browse search page naturally (trusted mouse wander + scroll)
-      await browsePageNaturally(searchTabId);
-      await sleep(400 + Math.random() * 600);
+      // Browse search page naturally with real mouse
+      if (nativePort) {
+        await browsePageNaturally(searchTabId);
+        await sleep(300 + Math.random() * 500);
 
-      // Scroll back to top to start row-by-row
-      try {
-        await cdpSend(searchTabId, "Input.dispatchMouseEvent", {
-          type: "mouseWheel",
-          x: lastMouseX,
-          y: lastMouseY,
-          deltaX: 0,
-          deltaY: -10000,
-        });
-      } catch (e) {}
-      await sleep(500 + Math.random() * 500);
+        // Scroll back to top
+        await trustedScroll(-3000);
+        await sleep(400 + Math.random() * 400);
+      }
 
       // Get all listing positions
       let listings;
@@ -559,44 +504,38 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         const rowEnd = Math.min(rowStart + ROW_SIZE, listings.length);
         const rowListings = listings.slice(rowStart, rowEnd);
 
-        // Scroll search page to make this row visible
-        if (rowStart > 0) {
+        // Scroll to next row on search page
+        if (rowStart > 0 && nativePort) {
           await chrome.tabs.update(searchTabId, { active: true });
           await sleep(100 + Math.random() * 150);
-          // Scroll one row height (~350px)
-          await trustedScroll(searchTabId, 300 + Math.random() * 100);
-          await sleep(300 + Math.random() * 400);
+          await calibrateCoordinates(searchTabId);
+          await trustedScroll(300 + Math.random() * 80);
+          await sleep(250 + Math.random() * 350);
         }
 
-        // Mouse wander over the row (scanning results)
-        if (debuggerTabs.has(searchTabId)) {
-          const centerY = 300 + Math.random() * 200;
-          await trustedMouseMove(searchTabId, 200 + Math.random() * 300, centerY);
-          await sleep(100 + Math.random() * 200);
-        }
-
-        // Re-read positions (may have shifted from scrolling)
+        // Re-read positions after scroll
         let freshPositions;
         try {
           freshPositions = await getListingPositions(searchTabId);
         } catch (e) {
           freshPositions = [];
         }
+        if (nativePort) {
+          await calibrateCoordinates(searchTabId);
+        }
 
-        // Open each listing in this row as a new tab
+        // Move mouse to each listing in the row, then open it
         const rowTabs = [];
         for (let j = 0; j < rowListings.length; j++) {
           const listing = rowListings[j];
-
-          // Find the fresh position for this listing
           const freshPos = freshPositions.find((p) => p.id === listing.id);
-          const targetX = freshPos ? freshPos.x : 300 + j * 200;
-          const targetY = freshPos ? freshPos.y : 300;
+          const targetX = freshPos ? freshPos.x : 200 + j * 220;
+          const targetY = freshPos ? freshPos.y : 350;
 
-          // Move mouse to this listing (Bezier curve — trusted)
-          if (debuggerTabs.has(searchTabId)) {
-            await trustedMouseMove(searchTabId, targetX, targetY);
-            await sleep(50 + Math.random() * 100);
+          // Move real cursor to this listing (hover over it)
+          if (nativePort) {
+            await trustedMouseMove(targetX, targetY);
+            await sleep(40 + Math.random() * 100);
           }
 
           // Open in new tab
@@ -606,16 +545,14 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
             activeTabs.push(tab.id);
           } catch (e) {}
 
-          // Brief pause between "clicks" (human rhythm)
-          await sleep(80 + Math.random() * 150);
+          await sleep(60 + Math.random() * 120);
         }
 
         // Wait for all tabs to load in parallel
         if (rowTabs.length > 0) {
           await waitForAllTabs(rowTabs.map((t) => t.id), 15000);
         }
-
-        await sleep(200 + Math.random() * 300);
+        await sleep(150 + Math.random() * 250);
 
         // ---- Visit each tab one by one ----
         for (let j = 0; j < rowTabs.length; j++) {
@@ -623,13 +560,13 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
           state.listingsChecked++;
 
           try {
-            // Switch to this tab (real tab switch)
+            // Switch to this tab
             await chrome.tabs.update(tabId, { active: true });
-            await sleep(100 + Math.random() * 200);
+            await sleep(100 + Math.random() * 150);
 
             // CAPTCHA check
             if (await hasCaptcha(tabId)) {
-              log(`CAPTCHA on listing after ${state.listingsChecked} checks. Solve it and restart.`);
+              log(`Access restricted after ${state.listingsChecked} listings.`);
               state.status = "error";
               saveState();
               broadcast();
@@ -643,13 +580,12 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
               return;
             }
 
-            // Attach debugger to listing tab for trusted interaction
-            const listingDbg = await attachDebugger(tabId);
-            if (listingDbg) {
+            // Browse listing with real mouse
+            if (nativePort) {
               await quickBrowseListing(tabId);
             }
 
-            // Read demand signal (DOM read only — invisible to detection)
+            // Read demand signal (DOM only — invisible)
             const result = await checkListingTab(tabId);
 
             if (result) {
@@ -662,17 +598,14 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
               state.productsFound++;
               log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
             }
-
-            // Detach debugger before closing
-            await detachDebugger(tabId);
           } catch (e) {}
 
-          // Variable delay: 85% quick glance, 15% longer read
-          const glanceTime =
+          // Variable dwell: 85% quick glance, 15% longer read
+          const dwell =
             Math.random() < 0.15
-              ? 600 + Math.random() * 1000
-              : 150 + Math.random() * 300;
-          await sleep(glanceTime);
+              ? 500 + Math.random() * 900
+              : 120 + Math.random() * 280;
+          await sleep(dwell);
         }
 
         // Close all row tabs
@@ -694,22 +627,20 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
         }
 
         // Inter-row pause
-        await sleep(150 + Math.random() * 350);
+        await sleep(150 + Math.random() * 300);
 
-        // Occasional "distraction" pause (~10% of rows)
+        // Occasional distraction pause (~10%)
         if (Math.random() < 0.1) {
-          await sleep(1500 + Math.random() * 3000);
+          await sleep(1200 + Math.random() * 2500);
         }
       }
 
       // Between search pages
       if (page < totalPages) {
-        await sleep(1000 + Math.random() * 2000);
-
-        // Longer break every 5 pages
+        await sleep(800 + Math.random() * 1500);
         if (page % 5 === 0) {
           log("Brief break...");
-          await sleep(3000 + Math.random() * 5000);
+          await sleep(2500 + Math.random() * 4000);
         }
       }
     }
@@ -731,15 +662,17 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
   }
 
   // Cleanup
-  for (const tabId of activeTabs) {
-    await detachDebugger(tabId);
-    await closeTab(tabId);
-  }
+  for (const tabId of activeTabs) await closeTab(tabId);
   activeTabs = [];
   if (searchTabId) {
-    await detachDebugger(searchTabId);
     await closeTab(searchTabId);
     searchTabId = null;
+  }
+  // Disconnect native host
+  if (nativePort) {
+    try { nativePort.disconnect(); } catch (e) {}
+    nativePort = null;
+    nativeReady = false;
   }
 
   saveState();
