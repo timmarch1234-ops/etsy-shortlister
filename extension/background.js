@@ -132,7 +132,7 @@ let nativeReady = false;
 let pendingResolve = null;
 
 function connectNative() {
-  if (nativePort) return;
+  if (nativePort) return true;
   try {
     nativePort = chrome.runtime.connectNative("com.etsy.shortlister");
 
@@ -149,24 +149,28 @@ function connectNative() {
         chrome.runtime.lastError?.message || "");
       nativePort = null;
       nativeReady = false;
-      pendingResolve = null;
+      // Resolve any pending command so it doesn't hang
+      if (pendingResolve) {
+        const resolve = pendingResolve;
+        pendingResolve = null;
+        resolve({ ok: false, error: "disconnected" });
+      }
     });
 
     nativeReady = true;
+    return true;
   } catch (e) {
     console.log("[shortlister] Failed to connect native host:", e.message);
     nativePort = null;
     nativeReady = false;
+    return false;
   }
 }
 
 function sendNativeCommand(command) {
   return new Promise((resolve, reject) => {
     if (!nativePort) {
-      connectNative();
-    }
-    if (!nativePort) {
-      reject(new Error("Native host not available"));
+      resolve({ ok: false, error: "not connected" });
       return;
     }
     pendingResolve = resolve;
@@ -174,16 +178,17 @@ function sendNativeCommand(command) {
       nativePort.postMessage(command);
     } catch (e) {
       pendingResolve = null;
-      reject(e);
+      resolve({ ok: false, error: e.message });
+      return;
     }
 
-    // Timeout for long operations (Bezier movement can take ~500ms)
+    // Timeout — don't hang if host doesn't respond
     setTimeout(() => {
       if (pendingResolve === resolve) {
         pendingResolve = null;
         resolve({ ok: true, timeout: true });
       }
-    }, 5000);
+    }, 3000);
   });
 }
 
@@ -405,16 +410,24 @@ async function runMainSearch(keyword, backendUrl, reportProgress) {
     if (reportProgress) await reportProgress("running");
 
     // Connect to native mouse controller
-    connectNative();
-    if (!nativePort) {
-      log("WARNING: Native mouse host not connected. Run install.sh first.");
-      log("Continuing without real mouse movement...");
-    } else {
-      // Ping to verify connection
-      const pong = await sendNativeCommand({ action: "ping" });
-      if (pong?.ok) {
-        log("Real mouse control active.");
+    const nativeConnected = connectNative();
+    if (nativePort) {
+      try {
+        const pong = await sendNativeCommand({ action: "ping" });
+        if (pong?.ok && !pong.error) {
+          log("Real mouse control active.");
+        } else {
+          log("Native host not responding. Continuing without real mouse.");
+          nativePort = null;
+          nativeReady = false;
+        }
+      } catch (e) {
+        log("Native host error. Continuing without real mouse.");
+        nativePort = null;
+        nativeReady = false;
       }
+    } else {
+      log("No native mouse host. Continuing without real mouse movement.");
     }
 
     // Create search tab (foreground)
