@@ -564,29 +564,520 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// ---- Poll backend for queued searches ----
-let currentQueuedSearchId = null;
+// ============================================================
+// MV3 ALARM-DRIVEN SEARCH ENGINE v3.0
+//
+// Two tick types:
+//   "searchPage"  — loads one search results page, collects
+//                   listing URLs into a queue
+//   "listing"     — visits ONE individual listing page,
+//                   extracts demand signals (sold count, etc.)
+//
+// Each alarm tick does ONE action then yields control back.
+// State is persisted to chrome.storage after every tick.
+// Max 8 listings visited per search page to stay safe.
+// 10-20s delays between listing visits, 20-40s between pages.
+// ============================================================
 
+const ALARM_NAME = "searchTick";
+const LISTINGS_PER_PAGE = 8; // max listings to visit per search page
+
+// Kick off a new search — just saves state and sets alarm
+async function startAlarmSearch(keyword, searchId, backendUrl) {
+  const tickState = {
+    keyword,
+    searchId,
+    backendUrl,
+    currentPage: 0,
+    totalPages: 20,
+    // Queue of listing URLs to visit from current search page
+    listingQueue: [],
+    listingQueuePage: 0, // which search page the queue came from
+    matchingProducts: [],
+    listingsChecked: 0,
+    productsFound: 0,
+    log: [],
+    status: "running",
+    warmupDone: false,
+  };
+  await chrome.storage.local.set({ tickState });
+  await updateProgress(tickState);
+  chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.01 });
+}
+
+async function updateProgress(ts) {
+  const backendUrl = ts.backendUrl || DEFAULT_BACKEND;
+  if (!ts.searchId) return;
+  try {
+    await fetch(`${backendUrl}/api/queue/${ts.searchId}/progress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status: ts.status,
+        progress: {
+          currentPage: ts.currentPage,
+          totalPages: ts.totalPages,
+          listingsChecked: ts.listingsChecked,
+          productsFound: ts.productsFound,
+          log: ts.log.slice(-50),
+        },
+      }),
+    });
+  } catch (e) {}
+}
+
+function tsLog(ts, msg) {
+  ts.log.push(msg);
+  console.log("[shortlister]", msg);
+}
+
+// ----------------------------------------------------------
+// Extract listing URLs from a search results page
+// ----------------------------------------------------------
+async function collectListingUrls(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const urls = [];
+      const seen = new Set();
+      const links = document.querySelectorAll('a[href*="/listing/"]');
+      for (const link of links) {
+        const m = link.href.match(/\/listing\/(\d+)/);
+        if (!m || seen.has(m[1])) continue;
+        seen.add(m[1]);
+        // Build clean URL
+        urls.push({
+          listingId: m[1],
+          url: `https://www.etsy.com/listing/${m[1]}`,
+          // Grab title from the card if available
+          cardTitle: (link.closest('[data-listing-id]') ||
+                      link.closest('.v2-listing-card') ||
+                      link.parentElement?.parentElement)
+                     ?.querySelector('h3, h2, [class*="title"]')
+                     ?.textContent?.trim()?.substring(0, 120) || "",
+          // Grab image from the card
+          cardImage: (link.closest('[data-listing-id]') ||
+                      link.closest('.v2-listing-card') ||
+                      link.parentElement?.parentElement)
+                     ?.querySelector('img')?.src || "",
+        });
+      }
+      return urls;
+    },
+  });
+  return results[0]?.result || [];
+}
+
+// ----------------------------------------------------------
+// Extract demand signals from an individual listing page
+// ----------------------------------------------------------
+async function extractFromListingPage(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const text = document.body?.innerText || "";
+      const html = document.documentElement?.innerHTML || "";
+      const result = {
+        title: "",
+        price: "",
+        sold_count: null,
+        demand_signal: null,
+        image_url: "",
+        shop_name: "",
+      };
+
+      // Title — from og:title or first h1
+      const ogTitle = document.querySelector('meta[property="og:title"]');
+      result.title = ogTitle?.content ||
+                     document.querySelector('h1')?.textContent?.trim() || "";
+
+      // Image
+      const ogImage = document.querySelector('meta[property="og:image"]');
+      result.image_url = ogImage?.content || "";
+
+      // Price
+      const priceEl = document.querySelector('[data-buy-box-listing-price]') ||
+                       document.querySelector('[class*="price"]') ||
+                       document.querySelector('p[class*="Price"]');
+      if (priceEl) result.price = priceEl.textContent?.trim() || "";
+
+      // Shop name
+      const shopLink = document.querySelector('a[href*="/shop/"]');
+      if (shopLink) {
+        const shopMatch = shopLink.href.match(/\/shop\/([^/?]+)/);
+        result.shop_name = shopMatch ? shopMatch[1] : "";
+      }
+
+      // ----- Demand signals -----
+
+      // "X bought in the last 24 hours"
+      const boughtMatch = text.match(
+        /(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s*hours/i
+      );
+      if (boughtMatch) {
+        result.demand_signal = boughtMatch[0].trim();
+        result.sold_count = boughtMatch[1];
+      }
+
+      // "In demand" badge
+      if (!result.demand_signal && /in\s+demand/i.test(text)) {
+        result.demand_signal = "In demand";
+        // Try to find nearby number
+        const nearbyMatch = text.match(/in\s+demand[.\s]*(\d+)\+?\s+(?:people\s+)?bought/i);
+        if (nearbyMatch) result.sold_count = nearbyMatch[1];
+      }
+
+      // "X people have this in their basket/cart"
+      if (!result.demand_signal) {
+        const basketMatch = text.match(
+          /(\d+\+?)\s+people\s+have\s+this\s+in\s+their\s+(?:basket|cart)/i
+        );
+        if (basketMatch) {
+          result.demand_signal = basketMatch[0].trim();
+          result.sold_count = basketMatch[1];
+        }
+      }
+
+      // "In X+ baskets/carts"
+      if (!result.demand_signal) {
+        const inBasketMatch = text.match(
+          /in\s+(\d+\+?)\s+(?:basket|cart)s?/i
+        );
+        if (inBasketMatch) {
+          result.demand_signal = inBasketMatch[0].trim();
+          result.sold_count = inBasketMatch[1];
+        }
+      }
+
+      // "Bestseller" badge
+      if (!result.demand_signal && /bestseller/i.test(text)) {
+        result.demand_signal = "Bestseller";
+      }
+
+      // "Popular now" badge
+      if (!result.demand_signal && /popular\s+now/i.test(text)) {
+        result.demand_signal = "Popular now";
+      }
+
+      // "Only X left" / low stock
+      if (!result.demand_signal) {
+        const lowStock = text.match(/only\s+(\d+)\s+left/i);
+        if (lowStock) {
+          result.demand_signal = lowStock[0].trim();
+          result.sold_count = lowStock[1];
+        }
+      }
+
+      // Total sales count (often shown as "X sales" on listing page)
+      if (!result.sold_count) {
+        const salesMatch = text.match(/([\d,]+)\s+sales?/i);
+        if (salesMatch) {
+          const salesNum = parseInt(salesMatch[1].replace(/,/g, ""), 10);
+          // Only flag as demand signal if high sales
+          if (salesNum >= 100) {
+            result.sold_count = salesMatch[1];
+            if (!result.demand_signal) {
+              result.demand_signal = `${salesMatch[1]} sales`;
+            }
+          }
+        }
+      }
+
+      return result;
+    },
+  });
+  return results[0]?.result || null;
+}
+
+// ----------------------------------------------------------
+// Process one tick
+// ----------------------------------------------------------
+async function processTick() {
+  const data = await chrome.storage.local.get(["tickState", "backendUrl"]);
+  let ts = data.tickState;
+  if (!ts || ts.status !== "running") return;
+  if (data.backendUrl) ts.backendUrl = data.backendUrl;
+
+  const backendUrl = ts.backendUrl || DEFAULT_BACKEND;
+
+  try {
+    // ---- Step 0: warmup ----
+    if (!ts.warmupDone) {
+      tsLog(ts, "Visiting Etsy homepage...");
+      const tab = await chrome.tabs.create({ url: "https://www.etsy.com", active: true });
+      await waitForTab(tab.id);
+      await sleep(3000 + Math.random() * 2000);
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      ts.warmupDone = true;
+      await chrome.storage.local.set({ tickState: ts });
+      await updateProgress(ts);
+      chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.05 });
+      return;
+    }
+
+    // ---- If there are listings queued, visit the next one ----
+    if (ts.listingQueue && ts.listingQueue.length > 0) {
+      const listing = ts.listingQueue.shift();
+      ts.listingsChecked++;
+
+      tsLog(ts, `Visiting listing ${listing.listingId} (${ts.listingQueue.length} remaining)...`);
+
+      const tab = await chrome.tabs.create({ url: listing.url, active: true });
+      try {
+        await waitForTab(tab.id);
+      } catch (e) {
+        tsLog(ts, `Listing ${listing.listingId}: load timeout, skipping.`);
+        await chrome.tabs.remove(tab.id).catch(() => {});
+        await chrome.storage.local.set({ tickState: ts });
+        scheduleNextListingTick(ts);
+        return;
+      }
+      await sleep(2000 + Math.random() * 2000);
+
+      // Captcha check
+      if (await hasCaptcha(tab.id)) {
+        tsLog(ts, "Access restricted! Pausing search.");
+        ts.status = "error";
+        // Put the listing back
+        ts.listingQueue.unshift(listing);
+        await chrome.storage.local.set({ tickState: ts });
+        await updateProgress(ts);
+        await chrome.tabs.remove(tab.id).catch(() => {});
+        return;
+      }
+
+      // Scroll the listing page naturally
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async () => {
+            for (let i = 0; i < 4; i++) {
+              window.scrollBy(0, 400);
+              await new Promise(r => setTimeout(r, 400 + Math.random() * 300));
+            }
+          },
+        });
+      } catch (e) {}
+      await sleep(1000 + Math.random() * 1000);
+
+      // Extract demand signals
+      let listingData = null;
+      try {
+        listingData = await extractFromListingPage(tab.id);
+      } catch (e) {
+        tsLog(ts, `Listing ${listing.listingId}: extract failed — ${e.message}`);
+      }
+
+      await chrome.tabs.remove(tab.id).catch(() => {});
+
+      if (listingData && listingData.demand_signal) {
+        ts.productsFound++;
+        const product = {
+          title: listingData.title || listing.cardTitle || "",
+          url: listing.url,
+          image_url: listingData.image_url || listing.cardImage || "",
+          sold_count: listingData.demand_signal,
+          price: listingData.price || "",
+          shop_name: listingData.shop_name || "",
+        };
+        ts.matchingProducts.push(product);
+        tsLog(ts, `✓ FOUND: ${listingData.demand_signal} — ${product.title.substring(0, 60)}`);
+      } else {
+        tsLog(ts, `  No demand signal on listing ${listing.listingId}`);
+      }
+
+      // Flush matches every 5 products
+      if (ts.matchingProducts.length >= 5) {
+        await sendToBackend(backendUrl, ts.keyword, ts.matchingProducts.splice(0));
+      }
+
+      await chrome.storage.local.set({ tickState: ts });
+      await updateProgress(ts);
+
+      // If more listings in queue, schedule next listing visit
+      if (ts.listingQueue.length > 0) {
+        scheduleNextListingTick(ts);
+      } else {
+        // Queue exhausted — move to next search page
+        tsLog(ts, `Finished listings for search page ${ts.listingQueuePage}.`);
+        scheduleNextSearchPageTick(ts);
+      }
+      return;
+    }
+
+    // ---- No listings queued — load next search results page ----
+    ts.currentPage++;
+    if (ts.currentPage > ts.totalPages) {
+      // All done!
+      ts.status = "completed";
+      tsLog(ts, `Done! Checked ${ts.listingsChecked} listings, found ${ts.productsFound} with demand signals.`);
+      if (ts.matchingProducts.length > 0) {
+        await sendToBackend(backendUrl, ts.keyword, ts.matchingProducts);
+        ts.matchingProducts = [];
+      }
+      await chrome.storage.local.set({ tickState: ts });
+      await updateProgress(ts);
+      return;
+    }
+
+    tsLog(ts, `Loading search page ${ts.currentPage} of ${ts.totalPages}...`);
+    await updateProgress(ts);
+
+    const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(ts.keyword)}&ref=search_bar&page=${ts.currentPage}`;
+    const tab = await chrome.tabs.create({ url: searchUrl, active: true });
+    try {
+      await waitForTab(tab.id);
+    } catch (e) {
+      tsLog(ts, `Search page ${ts.currentPage}: load timeout, skipping.`);
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      await chrome.storage.local.set({ tickState: ts });
+      scheduleNextSearchPageTick(ts);
+      return;
+    }
+    await sleep(2000 + Math.random() * 2000);
+
+    // Captcha check
+    if (await hasCaptcha(tab.id)) {
+      tsLog(ts, "Access restricted! Pausing search.");
+      ts.status = "error";
+      await chrome.storage.local.set({ tickState: ts });
+      await updateProgress(ts);
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      return;
+    }
+
+    // Scroll through the search page to load lazy content
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async () => {
+          for (let i = 0; i < 10; i++) {
+            window.scrollBy(0, 500);
+            await new Promise(r => setTimeout(r, 300));
+          }
+          window.scrollTo(0, 0);
+        },
+      });
+    } catch (e) {}
+    await sleep(1000 + Math.random() * 1000);
+
+    // Collect listing URLs from the search page
+    let allListings = [];
+    try {
+      allListings = await collectListingUrls(tab.id);
+    } catch (e) {
+      tsLog(ts, `Search page ${ts.currentPage}: failed to collect URLs — ${e.message}`);
+    }
+
+    await chrome.tabs.remove(tab.id).catch(() => {});
+
+    // Pick up to LISTINGS_PER_PAGE listings to visit
+    // Shuffle them slightly to look more natural
+    const shuffled = allListings.sort(() => Math.random() - 0.5);
+    ts.listingQueue = shuffled.slice(0, LISTINGS_PER_PAGE);
+    ts.listingQueuePage = ts.currentPage;
+
+    tsLog(ts, `Search page ${ts.currentPage}: found ${allListings.length} listings, will visit ${ts.listingQueue.length}.`);
+
+    await chrome.storage.local.set({ tickState: ts });
+    await updateProgress(ts);
+
+    if (ts.listingQueue.length > 0) {
+      // Start visiting listings after a short delay
+      scheduleNextListingTick(ts);
+    } else {
+      // No listings found — move to next search page
+      scheduleNextSearchPageTick(ts);
+    }
+
+  } catch (e) {
+    console.error("[shortlister] tick error:", e);
+    tsLog(ts, `Tick error: ${e.message}`);
+    await chrome.storage.local.set({ tickState: ts });
+    chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.5 });
+  }
+}
+
+// Schedule the next listing visit (10-20s delay)
+function scheduleNextListingTick(ts) {
+  const delayMs = 10000 + Math.random() * 10000;
+  chrome.alarms.create(ALARM_NAME, { delayInMinutes: delayMs / 60000 });
+  tsLog(ts, `Next listing in ${Math.round(delayMs / 1000)}s...`);
+  chrome.storage.local.set({ tickState: ts });
+}
+
+// Schedule the next search page load (20-40s delay, extra break every 5 pages)
+function scheduleNextSearchPageTick(ts) {
+  const delayMs = 20000 + Math.random() * 20000;
+  const extraMs = (ts.currentPage % 5 === 0) ? 20000 + Math.random() * 20000 : 0;
+  const totalMinutes = (delayMs + extraMs) / 60000;
+  chrome.alarms.create(ALARM_NAME, { delayInMinutes: totalMinutes });
+  tsLog(ts, `Next search page in ${Math.round((delayMs + extraMs) / 1000)}s...`);
+  chrome.storage.local.set({ tickState: ts });
+}
+
+async function sendToBackend(backendUrl, keyword, products) {
+  try {
+    const resp = await fetch(`${backendUrl}/api/products`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keyword, products }),
+    });
+    const data = await resp.json();
+    console.log(`[shortlister] Sent ${data.count} products to backend.`);
+  } catch (e) {
+    console.log("[shortlister] Failed to send:", e.message);
+  }
+}
+
+function waitForTab(tabId) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("Tab load timeout"));
+    }, 30000);
+    function listener(id, info) {
+      if (id === tabId && info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timeout);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+// ---- Poll backend for queued searches ----
 async function pollForQueuedSearches() {
   let backendUrl = DEFAULT_BACKEND;
   try {
-    const data = await chrome.storage.local.get(["backendUrl"]);
+    const data = await chrome.storage.local.get(["backendUrl", "tickState"]);
     if (data.backendUrl) backendUrl = data.backendUrl;
+    // If a tick search is already running, don't start another
+    if (data.tickState && data.tickState.status === "running") return;
   } catch (e) {}
-
-  if (state && state.status === "running") return;
 
   try {
     const resp = await fetch(`${backendUrl}/api/queue/pending`);
     const pending = await resp.json();
     if (pending.length > 0) {
       const search = pending[0];
-      currentQueuedSearchId = search.search_id;
       await fetch(`${backendUrl}/api/queue/${search.search_id}/claim`, { method: "POST" });
-      await runQueuedSearch(search.keyword, search.search_id, backendUrl);
+      await startAlarmSearch(search.keyword, search.search_id, backendUrl);
     }
   } catch (e) {}
 }
 
-setInterval(pollForQueuedSearches, 3000);
+// MV3: Alarm-driven polling and search execution
+chrome.alarms.create("pollQueue", { periodInMinutes: 0.5 });
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "pollQueue") {
+    pollForQueuedSearches();
+  } else if (alarm.name === ALARM_NAME) {
+    processTick();
+  }
+});
+
+// Boot immediately
 pollForQueuedSearches();
