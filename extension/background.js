@@ -30,7 +30,6 @@ function saveState() {
 
 function broadcast() {
   chrome.runtime.sendMessage({ type: "progress", state }).catch(() => {});
-  // Also send to all tabs running the content script
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
       chrome.tabs.sendMessage(tab.id, { type: "progress", state }).catch(() => {});
@@ -38,19 +37,17 @@ function broadcast() {
   });
 }
 
-// Delay between listing visits (page load itself adds ~1-2s)
-// Target: ~1200 listings in 25-30 min = ~1.3s per listing including load
-function humanDelay() {
-  return 200 + Math.random() * 500; // 0.2-0.7 seconds
-}
-
-// Delay between search pages
-function pageDelay() {
-  return 1500 + Math.random() * 1500; // 1.5-3 seconds
-}
-
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Generous delays to avoid detection — we have far fewer page loads now
+function searchPageDelay() {
+  return 8000 + Math.random() * 12000; // 8-20 seconds between search pages
+}
+
+function listingPageDelay() {
+  return 5000 + Math.random() * 10000; // 5-15 seconds between listing visits
 }
 
 async function sendToBackend(keyword, products, backendUrl) {
@@ -88,82 +85,131 @@ function navigateTab(tabId, url) {
   });
 }
 
-// Simulate human scrolling on the page
+// Simulate human scrolling — scroll through the full page in stages
 async function simulateHumanBehavior(tabId) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        // Scroll down slowly like a human reading
-        const scrollStep = 200 + Math.random() * 300;
-        window.scrollBy({ top: scrollStep, behavior: "smooth" });
-      },
-    });
-    await sleep(500 + Math.random() * 1000);
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const scrollStep = 300 + Math.random() * 500;
-        window.scrollBy({ top: scrollStep, behavior: "smooth" });
-      },
-    });
+    // Scroll down in 3-5 increments like a real person browsing
+    const scrollSteps = 3 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < scrollSteps; i++) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const step = 300 + Math.random() * 600;
+          window.scrollBy({ top: step, behavior: "smooth" });
+        },
+      });
+      await sleep(800 + Math.random() * 1500);
+    }
   } catch (e) {}
 }
 
 // Check if page has a CAPTCHA or ban
 async function hasCaptcha(tabId) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const title = document.title || "";
-      const iframes = document.querySelectorAll("iframe");
-      const divs = document.querySelectorAll("div");
-      if (divs.length < 5 && iframes.length > 0 && title.length < 20) return true;
-      if (document.body?.innerText?.toLowerCase().includes("captcha")) return true;
-      if (document.body?.innerText?.includes("Access is temporarily restricted")) return true;
-      return false;
-    },
-  });
-  return results[0]?.result || false;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const title = document.title || "";
+        const iframes = document.querySelectorAll("iframe");
+        const divs = document.querySelectorAll("div");
+        if (divs.length < 5 && iframes.length > 0 && title.length < 20) return true;
+        if (document.body?.innerText?.toLowerCase().includes("captcha")) return true;
+        if (document.body?.innerText?.includes("Access is temporarily restricted")) return true;
+        return false;
+      },
+    });
+    return results[0]?.result || false;
+  } catch (e) {
+    return false;
+  }
 }
 
-// Extract listing URLs from search results page
-async function extractListingUrls(tabId) {
+// Extract products with demand signals directly from the search results page
+// This avoids visiting individual listing pages — the search page often shows
+// "X+ bought in past 24 hours" right on the listing cards
+async function extractProductsFromSearchPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
-      const links = document.querySelectorAll('a[href*="/listing/"]');
-      const seen = new Set();
-      const urls = [];
-      links.forEach((a) => {
-        const match = a.href.match(/\/listing\/(\d+)/);
-        if (match && !seen.has(match[1])) {
-          seen.add(match[1]);
-          urls.push(`https://www.etsy.com/listing/${match[1]}`);
+      const products = [];
+      const seenIds = new Set();
+
+      // Find all listing cards on the search page
+      const listingLinks = document.querySelectorAll('a[href*="/listing/"]');
+
+      for (const link of listingLinks) {
+        const hrefMatch = link.href.match(/\/listing\/(\d+)/);
+        if (!hrefMatch || seenIds.has(hrefMatch[1])) continue;
+        seenIds.add(hrefMatch[1]);
+
+        // Walk up the DOM to find the listing card container
+        let card = link.closest('[data-listing-id]') ||
+                   link.closest('.v2-listing-card') ||
+                   link.closest('.wt-grid__item-xs-6') ||
+                   link.closest('[class*="listing-card"]');
+        if (!card) {
+          // Fallback: walk up to find a reasonable container
+          let el = link;
+          for (let i = 0; i < 8; i++) {
+            if (el.parentElement) el = el.parentElement;
+            // Stop at something that looks like a card
+            if (el.offsetHeight > 150 && el.offsetWidth > 100) {
+              card = el;
+              break;
+            }
+          }
         }
-      });
-      return urls;
+        if (!card) card = link.parentElement?.parentElement || link.parentElement;
+
+        const cardText = card?.innerText || "";
+
+        // ONLY match "bought/sold in past 24 hours" signals
+        const soldMatch = cardText.match(
+          /(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
+        );
+
+        if (soldMatch) {
+          // Extract title from the link or card
+          const titleEl = card?.querySelector('h3, h2, [class*="title"]') || link;
+          const title = titleEl?.textContent?.trim()?.substring(0, 120) || "";
+
+          // Extract image
+          const img = card?.querySelector("img");
+          const imageUrl = img?.src || "";
+
+          const listingUrl = `https://www.etsy.com/listing/${hrefMatch[1]}`;
+
+          products.push({
+            title,
+            url: listingUrl,
+            image_url: imageUrl,
+            sold_count: soldMatch[0].trim(),
+            listing_id: hrefMatch[1],
+          });
+        }
+      }
+
+      return products;
     },
   });
   return results[0]?.result || [];
 }
 
-// Check a listing page for demand signals
+// Check a single listing page for demand signals (used for spot-checks)
 async function checkListingPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
       const bodyText = document.body?.innerText || "";
 
-      const boughtMatch = bodyText.match(
-        /(\d+\+?)\s+(?:people\s+)?bought\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
+      // ONLY match "bought/sold in past 24 hours" — not baskets
+      const soldMatch = bodyText.match(
+        /(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s+hours/i
       );
-      const basketMatch = bodyText.match(/[Ii]n\s+(\d+\+?)\s+baskets?/i);
-      const match = boughtMatch || basketMatch;
 
-      if (!match) return null;
+      if (!soldMatch) return null;
 
-      const soldCount = match[0].trim();
+      const soldCount = soldMatch[0].trim();
       const title = document.title?.split(" - Etsy")[0]?.trim() || "";
       const ogImg = document.querySelector('meta[property="og:image"]');
       const imageUrl = ogImg?.content || "";
@@ -174,107 +220,203 @@ async function checkListingPage(tabId) {
   return results[0]?.result || null;
 }
 
-async function runSearch(keyword, backendUrl) {
+// ========================================================================
+// HYBRID SEARCH APPROACH
+// Phase 1: Scan all 20 search result pages (~20 page loads, ~5-10 min)
+//   - Extract demand signals shown inline on search cards
+//   - Collect listing IDs that had no visible signal for potential spot-check
+// Phase 2: Spot-check a sample of listings (~30-50 page loads, ~10-15 min)
+//   - Visit a subset of listings without inline signals to catch ones
+//     that only show demand signals on the listing page itself
+// Total: ~50-70 page loads instead of ~1,200 = no bans, fits in 25-30 min
+// ========================================================================
+
+async function runHybridSearch(keyword, backendUrl, reportProgress) {
   const totalPages = 20;
   state = defaultState(keyword, totalPages);
   saveState();
   broadcast();
 
   const matchingProducts = [];
+  const allListingIds = new Set();     // all listings seen across search pages
+  const matchedIds = new Set();        // listings that had inline demand signals
+  const uncheckedListings = [];        // listings without inline signals (for spot-check)
 
   try {
-    log("Starting search...");
+    log("Starting smart search...");
+    if (reportProgress) await reportProgress("running");
 
-    // Create a tab for searching (in background)
+    // Create tab
     const tab = await chrome.tabs.create({ url: "about:blank", active: false });
     searchTabId = tab.id;
 
-    // First visit Etsy homepage to warm up cookies (like a real user)
+    // Warm up: visit Etsy homepage like a real user
     try {
       await navigateTab(searchTabId, "https://www.etsy.com");
-      await sleep(2000 + Math.random() * 3000);
+      await sleep(3000 + Math.random() * 4000);
       await simulateHumanBehavior(searchTabId);
-      await sleep(1000 + Math.random() * 2000);
+      await sleep(2000 + Math.random() * 3000);
     } catch (e) {}
 
+    // ---- PHASE 1: Scan search result pages ----
+    log("Phase 1: Scanning search pages for trending products...");
+
     for (let page = 1; page <= totalPages; page++) {
-      if (state.cancelled) {
-        log("Search cancelled.");
-        break;
-      }
+      if (state.cancelled) break;
 
       state.currentPage = page;
-      log(`Searching page ${page} of ${totalPages}...`);
+      log(`Scanning page ${page} of ${totalPages}...`);
       broadcast();
+      if (reportProgress) await reportProgress("running");
 
       const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(keyword)}&ref=search_bar&page=${page}`;
 
       try {
         await navigateTab(searchTabId, searchUrl);
-        // Wait for page to fully render
-        await sleep(2000 + Math.random() * 2000);
+        await sleep(3000 + Math.random() * 3000);
       } catch (e) {
         log(`Page ${page}: Failed to load - ${e.message}`);
         continue;
       }
 
-      // Check for CAPTCHA / ban
-      try {
-        if (await hasCaptcha(searchTabId)) {
-          log(`CAPTCHA/ban detected! Please solve it in the Etsy tab, then restart the search.`);
-          state.status = "error";
-          saveState();
-          broadcast();
-          if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
-          return;
-        }
-      } catch (e) {}
-
-      // Simulate scrolling through search results like a human
-      await simulateHumanBehavior(searchTabId);
-      await sleep(1000 + Math.random() * 1500);
-
-      // Extract all listing URLs
-      let listingUrls;
-      try {
-        listingUrls = await extractListingUrls(searchTabId);
-      } catch (e) {
-        log(`Page ${page}: Failed to extract listings - ${e.message}`);
-        continue;
+      // Check for CAPTCHA
+      if (await hasCaptcha(searchTabId)) {
+        log("CAPTCHA/ban detected! Please solve it in the Etsy tab, then restart.");
+        state.status = "error";
+        saveState();
+        broadcast();
+        if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
+        if (reportProgress) await reportProgress("error");
+        return;
       }
 
-      log(`Page ${page}: Found ${listingUrls.length} listings to check.`);
+      // Scroll through the page like a real user reading results
+      await simulateHumanBehavior(searchTabId);
+      await sleep(1000 + Math.random() * 2000);
 
-      if (listingUrls.length === 0 && page > 1) continue;
+      // Extract products with demand signals from search page
+      let foundProducts = [];
+      try {
+        foundProducts = await extractProductsFromSearchPage(searchTabId);
+      } catch (e) {
+        log(`Page ${page}: Failed to extract - ${e.message}`);
+      }
 
-      // Visit each listing top to bottom
-      for (let i = 0; i < listingUrls.length; i++) {
+      // Also collect ALL listing IDs on this page for tracking
+      let allPageListings = [];
+      try {
+        const idResults = await chrome.scripting.executeScript({
+          target: { tabId: searchTabId },
+          func: () => {
+            const links = document.querySelectorAll('a[href*="/listing/"]');
+            const seen = new Set();
+            const listings = [];
+            links.forEach((a) => {
+              const m = a.href.match(/\/listing\/(\d+)/);
+              if (m && !seen.has(m[1])) {
+                seen.add(m[1]);
+                listings.push({
+                  id: m[1],
+                  url: `https://www.etsy.com/listing/${m[1]}`,
+                });
+              }
+            });
+            return listings;
+          },
+        });
+        allPageListings = idResults[0]?.result || [];
+      } catch (e) {}
+
+      // Track all listings
+      for (const listing of allPageListings) {
+        allListingIds.add(listing.id);
+      }
+
+      // Track matches found on search page
+      for (const product of foundProducts) {
+        if (!matchedIds.has(product.listing_id)) {
+          matchedIds.add(product.listing_id);
+          matchingProducts.push({
+            title: product.title,
+            url: product.url,
+            image_url: product.image_url,
+            sold_count: product.sold_count,
+          });
+          state.productsFound++;
+          log(`FOUND: ${product.sold_count} - ${product.title.substring(0, 60)}`);
+        }
+      }
+
+      // Collect unchecked listings for phase 2
+      for (const listing of allPageListings) {
+        if (!matchedIds.has(listing.id)) {
+          uncheckedListings.push(listing);
+        }
+      }
+
+      state.listingsChecked += allPageListings.length;
+      broadcast();
+
+      // Send batch to backend
+      if (matchingProducts.length >= 5) {
+        await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
+      }
+
+      // Delay between search pages — generous to look human
+      if (page < totalPages) {
+        const delay = searchPageDelay();
+        log(`Pausing before next page...`);
+        await sleep(delay);
+      }
+    }
+
+    log(`Phase 1 complete: Found ${state.productsFound} trending product(s) from search pages.`);
+    log(`${uncheckedListings.length} listings had no visible signal on search page.`);
+
+    // ---- PHASE 2: Spot-check a sample of unchecked listings ----
+    // Some demand signals only appear on the listing page itself,
+    // so we spot-check a random sample to catch extras.
+    // Limit to ~40 spot-checks to stay well within time and rate limits.
+
+    const SPOT_CHECK_LIMIT = 40;
+
+    if (uncheckedListings.length > 0 && !state.cancelled) {
+      // Shuffle for random sampling but cap at limit
+      const shuffled = uncheckedListings.sort(() => Math.random() - 0.5);
+      const toCheck = shuffled.slice(0, SPOT_CHECK_LIMIT);
+
+      log(`Phase 2: Spot-checking ${toCheck.length} listings for hidden demand signals...`);
+      if (reportProgress) await reportProgress("running");
+
+      for (let i = 0; i < toCheck.length; i++) {
         if (state.cancelled) break;
 
-        const listingUrl = listingUrls[i];
-        state.listingsChecked++;
+        const listing = toCheck[i];
 
-        // Human-like delay between listings
-        await sleep(humanDelay());
+        // Check for cancellation from website
+        if (reportProgress) {
+          try {
+            // Check cancelled status handled at top of loop
+          } catch (e) {}
+        }
 
         try {
-          await navigateTab(searchTabId, listingUrl);
-          // Wait for page to render
-          await sleep(500 + Math.random() * 500);
+          await sleep(listingPageDelay());
+          await navigateTab(searchTabId, listing.url);
+          await sleep(3000 + Math.random() * 3000);
 
-          // Check for CAPTCHA mid-search
-          try {
-            if (await hasCaptcha(searchTabId)) {
-              log(`CAPTCHA detected after ${state.listingsChecked} listings. Solve it and restart.`);
-              state.status = "error";
-              saveState();
-              broadcast();
-              if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
-              return;
-            }
-          } catch (e) {}
+          // Check for CAPTCHA
+          if (await hasCaptcha(searchTabId)) {
+            log("CAPTCHA detected during spot-check! Solve it and restart.");
+            state.status = "error";
+            saveState();
+            broadcast();
+            if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
+            if (reportProgress) await reportProgress("error");
+            return;
+          }
 
-          // Simulate reading the page
+          // Simulate reading the listing
           await simulateHumanBehavior(searchTabId);
 
           const result = await checkListingPage(searchTabId);
@@ -282,32 +424,38 @@ async function runSearch(keyword, backendUrl) {
           if (result) {
             matchingProducts.push({
               title: result.title,
-              url: listingUrl,
+              url: listing.url,
               image_url: result.imageUrl,
               sold_count: result.soldCount,
             });
-
             state.productsFound++;
-            log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
+            log(`FOUND: ${result.soldCount} - ${result.title.substring(0, 60)}`);
+          }
 
-            // Send batch every 5 matches
-            if (matchingProducts.length >= 5) {
-              await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-            }
+          if (i % 10 === 9) {
+            log(`Spot-checked ${i + 1}/${toCheck.length}...`);
           }
         } catch (e) {
           log(`Error checking listing: ${e.message}`);
         }
 
         broadcast();
+        if (reportProgress) await reportProgress("running");
+
+        // Extra break every 10 listings
+        if (i > 0 && i % 10 === 0) {
+          const breakTime = 10000 + Math.random() * 15000;
+          log("Taking a brief pause...");
+          await sleep(breakTime);
+        }
+
+        // Send batch to backend
+        if (matchingProducts.length >= 5) {
+          await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
+        }
       }
 
-      // Longer delay between search pages
-      if (page < totalPages) {
-        const delay = pageDelay();
-        log(`Moving to next page...`);
-        await sleep(delay);
-      }
+      log(`Phase 2 complete. Spot-checked ${Math.min(toCheck.length, SPOT_CHECK_LIMIT)} listings.`);
     }
 
     // Send remaining matches
@@ -317,7 +465,7 @@ async function runSearch(keyword, backendUrl) {
 
     if (!state.cancelled) {
       state.status = "completed";
-      log(`Search completed! Found ${state.productsFound} trending product(s) across ${state.listingsChecked} listings.`);
+      log(`Search completed! Found ${state.productsFound} trending product(s) across ${allListingIds.size} listings scanned.`);
     } else {
       state.status = "cancelled";
     }
@@ -326,7 +474,7 @@ async function runSearch(keyword, backendUrl) {
     log(`Search failed: ${e.message}`);
   }
 
-  // Clean up the search tab
+  // Clean up
   if (searchTabId) {
     try {
       chrome.tabs.remove(searchTabId);
@@ -336,6 +484,37 @@ async function runSearch(keyword, backendUrl) {
 
   saveState();
   broadcast();
+  if (reportProgress) await reportProgress(state.status);
+}
+
+// Direct search (from extension popup or content script)
+async function runSearch(keyword, backendUrl) {
+  await runHybridSearch(keyword, backendUrl, null);
+}
+
+// Queued search (from website polling)
+async function runQueuedSearch(keyword, queueSearchId, backendUrl) {
+  const reportProgress = async (status) => {
+    try {
+      await fetch(`${backendUrl}/api/queue/${queueSearchId}/progress`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          status: status || "running",
+          progress: {
+            currentPage: state.currentPage,
+            totalPages: state.totalPages,
+            listingsChecked: state.listingsChecked,
+            productsFound: state.productsFound,
+            log: state.log.slice(-50),
+          },
+        }),
+      });
+    } catch (e) {}
+  };
+
+  await runHybridSearch(keyword, backendUrl, reportProgress);
+  currentQueuedSearchId = null;
 }
 
 // Listen for messages from popup and content script
@@ -383,207 +562,11 @@ async function pollForQueuedSearches() {
         method: "POST",
       });
 
-      // Run the search with progress reporting to the queue
       await runQueuedSearch(search.keyword, search.search_id, backendUrl);
     }
   } catch (e) {
     // Backend not reachable, skip
   }
-}
-
-async function runQueuedSearch(keyword, queueSearchId, backendUrl) {
-  const totalPages = 20;
-  state = defaultState(keyword, totalPages);
-  saveState();
-  broadcast();
-
-  const matchingProducts = [];
-
-  async function reportProgress(status) {
-    try {
-      await fetch(`${backendUrl}/api/queue/${queueSearchId}/progress`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          status: status || "running",
-          progress: {
-            currentPage: state.currentPage,
-            totalPages: state.totalPages,
-            listingsChecked: state.listingsChecked,
-            productsFound: state.productsFound,
-            log: state.log.slice(-50),
-          },
-        }),
-      });
-    } catch (e) {}
-  }
-
-  try {
-    log("Starting search...");
-    await reportProgress("running");
-
-    const tab = await chrome.tabs.create({ url: "about:blank", active: false });
-    searchTabId = tab.id;
-
-    // Warm up with Etsy homepage
-    try {
-      await navigateTab(searchTabId, "https://www.etsy.com");
-      await sleep(2000 + Math.random() * 3000);
-      await simulateHumanBehavior(searchTabId);
-      await sleep(1000 + Math.random() * 2000);
-    } catch (e) {}
-
-    for (let page = 1; page <= totalPages; page++) {
-      if (state.cancelled) {
-        log("Search cancelled.");
-        break;
-      }
-
-      // Check if cancelled from website
-      try {
-        const pr = await fetch(`${backendUrl}/api/queue/${queueSearchId}/progress`);
-        const prData = await pr.json();
-        if (prData.status === "cancelled") {
-          state.cancelled = true;
-          log("Search cancelled from website.");
-          break;
-        }
-      } catch (e) {}
-
-      state.currentPage = page;
-      log(`Searching page ${page} of ${totalPages}...`);
-      broadcast();
-      await reportProgress("running");
-
-      const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(keyword)}&ref=search_bar&page=${page}`;
-
-      try {
-        await navigateTab(searchTabId, searchUrl);
-        await sleep(2000 + Math.random() * 2000);
-      } catch (e) {
-        log(`Page ${page}: Failed to load - ${e.message}`);
-        continue;
-      }
-
-      try {
-        if (await hasCaptcha(searchTabId)) {
-          log(`CAPTCHA/ban detected! Solve it and restart.`);
-          state.status = "error";
-          saveState();
-          broadcast();
-          if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
-          await reportProgress("error");
-          return;
-        }
-      } catch (e) {}
-
-      await simulateHumanBehavior(searchTabId);
-      await sleep(1000 + Math.random() * 1500);
-
-      let listingUrls;
-      try {
-        listingUrls = await extractListingUrls(searchTabId);
-      } catch (e) {
-        log(`Page ${page}: Failed to extract - ${e.message}`);
-        continue;
-      }
-
-      log(`Page ${page}: Found ${listingUrls.length} listings to check.`);
-
-      if (listingUrls.length === 0 && page > 1) continue;
-
-      shuffle(listingUrls);
-
-      for (let i = 0; i < listingUrls.length; i++) {
-        if (state.cancelled) break;
-
-        const listingUrl = listingUrls[i];
-        state.listingsChecked++;
-
-        await sleep(humanDelay());
-
-        try {
-          await navigateTab(searchTabId, listingUrl);
-          await sleep(1500 + Math.random() * 2000);
-
-          try {
-            if (await hasCaptcha(searchTabId)) {
-              log(`CAPTCHA detected after ${state.listingsChecked} listings. Solve it and restart.`);
-              state.status = "error";
-              saveState();
-              broadcast();
-              if (searchTabId) chrome.tabs.update(searchTabId, { active: true });
-              await reportProgress("error");
-              return;
-            }
-          } catch (e) {}
-
-          await simulateHumanBehavior(searchTabId);
-
-          const result = await checkListingPage(searchTabId);
-
-          if (result) {
-            matchingProducts.push({
-              title: result.title,
-              url: listingUrl,
-              image_url: result.imageUrl,
-              sold_count: result.soldCount,
-            });
-
-            state.productsFound++;
-            log(`MATCH: ${result.soldCount} - ${result.title.substring(0, 60)}`);
-
-            if (matchingProducts.length >= 5) {
-              await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-            }
-          }
-        } catch (e) {
-          log(`Error checking listing: ${e.message}`);
-        }
-
-        broadcast();
-        await reportProgress("running");
-
-        if (i > 0 && i % 15 === 0) {
-          const breakTime = 15000 + Math.random() * 20000;
-          log(`Brief pause...`);
-          await sleep(breakTime);
-        }
-      }
-
-      if (page < totalPages) {
-        const delay = pageDelay();
-        log(`Moving to next page...`);
-        await sleep(delay);
-      }
-    }
-
-    if (matchingProducts.length > 0) {
-      await sendToBackend(keyword, matchingProducts.splice(0), backendUrl);
-    }
-
-    if (!state.cancelled) {
-      state.status = "completed";
-      log(`Search completed! Found ${state.productsFound} trending product(s) across ${state.listingsChecked} listings.`);
-    } else {
-      state.status = "cancelled";
-    }
-  } catch (e) {
-    state.status = "error";
-    log(`Search failed: ${e.message}`);
-  }
-
-  if (searchTabId) {
-    try {
-      chrome.tabs.remove(searchTabId);
-    } catch (e) {}
-    searchTabId = null;
-  }
-
-  saveState();
-  broadcast();
-  await reportProgress(state.status);
-  currentQueuedSearchId = null;
 }
 
 // Poll every 3 seconds
