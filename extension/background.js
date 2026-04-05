@@ -1,73 +1,53 @@
 // ============================================================
-// ETSY PRODUCT SHORTLISTER v6.0 — Simple & Reliable
+// ETSY PRODUCT SHORTLISTER v7.0
 //
-// Architecture: ONE alarm tick per action. Single reused tab.
+// Proven architecture: ONE tab, alarm-per-tick, sequential.
+// v3.0 ran 4 hours overnight without captcha — this is that
+// architecture optimized for speed.
 //
-// Phases:
-//   warmup    → visit Etsy homepage
-//   search    → load search page N, score listings, queue top 20
-//   listing   → visit ONE listing, extract demand signals
-//   (repeat listing until queue empty, then next search page)
+// Each alarm tick processes 5 listings sequentially in the
+// SAME tab: nav→extract→nav→extract→nav→extract→nav→extract→nav→extract
+// All Chrome API calls (tabs.update + scripting.executeScript),
+// no setTimeout. Service worker stays alive.
 //
 // Timing:
-//   20 listings/page × 3s = 60s active work per page
-//   Chrome bumps alarm to ~30s min (unpacked) or ~60s (packed)
-//   Worst case: 20 pages × (60s work + 60s alarm) = ~40 min
-//   Best case (unpacked): 20 pages × (60s + 5s) = ~22 min  ✓
+//   Each tick: 5 listings × ~2s = ~10s active work
+//   Alarm gap: ~30s (Chrome minimum for unpacked)
+//   Per search page: ~70 listings ÷ 5 = 14 ticks × 30s = ~7 min
+//   Total: warmup + 20 pages × 7 min = ~23 min  ✓
 //
-// Key insight: the service worker stays alive during continuous
-// Chrome API calls (tabs.update, scripting.executeScript). It
-// only dies during setTimeout. So we process ALL listings for
-// a page in one tick using activeWait (chrome.storage.get loop)
-// between each listing visit.
+// Phases (stored in tickState.phase):
+//   warmup  → visit homepage, schedule next tick
+//   search  → load search page, collect URLs into queue
+//   batch   → visit next 5 listings from queue, extract
+//             (repeats until queue empty, then → search)
 // ============================================================
 
 const DEFAULT_BACKEND = "https://etsy-shortlister-production-3d4e.up.railway.app";
 const ALARM_NAME = "searchTick";
 const TOTAL_SEARCH_PAGES = 20;
-const LISTINGS_PER_PAGE = 20; // top 20 most promising per page
+const BATCH_SIZE = 5; // listings per tick
 
 // ============================================================
-// UTILITY
-// ============================================================
-
-function gaussRand(mean, sd, min, max) {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  let z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-  let val = mean + z * sd;
-  if (min !== undefined) val = Math.max(min, val);
-  if (max !== undefined) val = Math.min(max, val);
-  return Math.round(val);
-}
-
-// Active wait — loops chrome.storage.local.get to keep worker alive
-// ~1-3ms per iteration, so 1000 iterations ≈ 1-3 seconds
-async function activeWait(iterations) {
-  for (let i = 0; i < iterations; i++) {
-    await chrome.storage.local.get(["_kl"]);
-  }
-}
-
-// ============================================================
-// TAB — single reused tab
+// TAB — single reused tab, stored in chrome.storage
 // ============================================================
 
 async function getTab() {
   const data = await chrome.storage.local.get(["tabId"]);
   if (data.tabId) {
     try {
-      await chrome.tabs.get(data.tabId);
-      return data.tabId;
+      const tab = await chrome.tabs.get(data.tabId);
+      if (tab) return data.tabId;
     } catch (e) {}
   }
-  console.log("[tab] creating new tab");
+  // Create fresh tab
   const tab = await chrome.tabs.create({ url: "about:blank", active: true });
   await chrome.storage.local.set({ tabId: tab.id });
+  console.log("[tab] created:", tab.id);
   return tab.id;
 }
 
+// Navigate and wait for complete. Returns true/false.
 function navTab(tabId, url) {
   return new Promise((resolve) => {
     let done = false;
@@ -90,7 +70,7 @@ function navTab(tabId, url) {
 }
 
 // ============================================================
-// CAPTCHA
+// CAPTCHA CHECK
 // ============================================================
 
 async function isCaptcha(tabId) {
@@ -112,11 +92,27 @@ async function isCaptcha(tabId) {
 }
 
 // ============================================================
-// COLLECT + SCORE listings from search page
-// Returns top LISTINGS_PER_PAGE sorted by signal strength
+// SCROLL (sync, no setTimeout)
 // ============================================================
 
-async function collectAndScoreListings(tabId) {
+async function scrollPage(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const h = document.body.scrollHeight;
+        for (let i = 1; i <= 6; i++) window.scrollTo(0, (h * i) / 6);
+        window.scrollTo(0, 0);
+      },
+    });
+  } catch (e) {}
+}
+
+// ============================================================
+// COLLECT ALL LISTING URLS from search page
+// ============================================================
+
+async function collectListings(tabId) {
   try {
     const r = await chrome.scripting.executeScript({
       target: { tabId },
@@ -124,7 +120,6 @@ async function collectAndScoreListings(tabId) {
         const out = [];
         const seen = new Set();
         const links = document.querySelectorAll('a[href*="/listing/"]');
-
         for (const link of links) {
           const m = link.href.match(/\/listing\/(\d+)/);
           if (!m || seen.has(m[1])) continue;
@@ -143,50 +138,28 @@ async function collectAndScoreListings(tabId) {
           }
           if (!card) card = link.parentElement?.parentElement || link.parentElement;
 
-          const ct = (card?.innerText || "").toLowerCase();
           const titleEl = card?.querySelector('h3, h2, [class*="title"]') || link;
           const img = card?.querySelector("img");
 
-          // Score the listing based on card-level signals
-          let score = 1; // base score — every listing gets visited eventually
-          if (/bought|sold/i.test(ct)) score += 50;
-          if (/in\s+demand/i.test(ct)) score += 40;
-          if (/bestseller/i.test(ct)) score += 30;
-          if (/popular\s*now/i.test(ct)) score += 25;
-          if (/only\s+\d+\s+left/i.test(ct)) score += 20;
-          // High ratings with many reviews
-          const rm = ct.match(/(4\.[5-9]|5\.0)\s*\((\d[\d,.k]*)\)/);
-          if (rm) {
-            let rc = rm[2].toLowerCase().replace(/,/g, "");
-            let n = rc.includes("k") ? parseFloat(rc) * 1000 : parseInt(rc, 10);
-            if (n >= 1000) score += 15;
-            else if (n >= 500) score += 10;
-            else if (n >= 100) score += 5;
-          }
-          // Skip ads
-          if (/^ad\b/i.test(ct) || card?.querySelector('[class*="ad-"]')) score -= 100;
-
           out.push({
-            listingId: m[1],
+            id: m[1],
             url: `https://www.etsy.com/listing/${m[1]}`,
-            cardTitle: titleEl?.textContent?.trim()?.substring(0, 120) || "",
-            cardImage: img?.src || "",
-            score,
+            title: titleEl?.textContent?.trim()?.substring(0, 120) || "",
+            img: img?.src || "",
           });
         }
-
-        return { total: seen.size, listings: out };
+        return out;
       },
     });
-    return r[0]?.result || { total: 0, listings: [] };
+    return r[0]?.result || [];
   } catch (e) {
-    console.log("[collect] error:", e.message);
-    return { total: 0, listings: [] };
+    console.log("[collect] err:", e.message);
+    return [];
   }
 }
 
 // ============================================================
-// EXTRACT demand signals from one listing page
+// EXTRACT DEMAND SIGNALS from one listing page
 // ============================================================
 
 async function extractListing(tabId) {
@@ -195,77 +168,57 @@ async function extractListing(tabId) {
       target: { tabId },
       func: () => {
         const t = document.body?.innerText || "";
-        const out = { title: "", price: "", sold_count: null, demand_signal: null, image_url: "", shop_name: "" };
+        const o = { title: "", price: "", sold_count: null, demand_signal: null, image_url: "", shop_name: "" };
 
-        out.title = document.querySelector('meta[property="og:title"]')?.content ||
-                    document.querySelector('h1')?.textContent?.trim() || "";
-        out.image_url = document.querySelector('meta[property="og:image"]')?.content || "";
+        o.title = document.querySelector('meta[property="og:title"]')?.content ||
+                  document.querySelector('h1')?.textContent?.trim() || "";
+        o.image_url = document.querySelector('meta[property="og:image"]')?.content || "";
 
         const p = document.querySelector('[data-buy-box-listing-price]') ||
                   document.querySelector('[class*="price"]');
-        if (p) out.price = p.textContent?.trim() || "";
+        if (p) o.price = p.textContent?.trim() || "";
 
         const sl = document.querySelector('a[href*="/shop/"]');
-        if (sl) { const m = sl.href.match(/\/shop\/([^/?]+)/); out.shop_name = m ? m[1] : ""; }
+        if (sl) { const m = sl.href.match(/\/shop\/([^/?]+)/); o.shop_name = m ? m[1] : ""; }
 
-        // Demand signals — ordered by strength
-        let bm = t.match(/(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s*hours/i);
-        if (bm) { out.demand_signal = bm[0].trim(); out.sold_count = bm[1]; return out; }
+        // Demand signals
+        let m;
+        m = t.match(/(\d+\+?)\s+(?:people\s+)?(?:bought|sold)\s+(?:this\s+)?in\s+(?:the\s+)?(?:past|last)\s+24\s*hours/i);
+        if (m) { o.demand_signal = m[0].trim(); o.sold_count = m[1]; return o; }
 
         if (/in\s+demand/i.test(t)) {
-          out.demand_signal = "In demand";
-          let n = t.match(/in\s+demand[.\s]*(\d+)\+?\s+(?:people\s+)?bought/i);
-          if (n) out.sold_count = n[1];
-          return out;
+          o.demand_signal = "In demand";
+          m = t.match(/in\s+demand[.\s]*(\d+)\+?\s+(?:people\s+)?bought/i);
+          if (m) o.sold_count = m[1];
+          return o;
         }
 
-        bm = t.match(/(\d+\+?)\s+people\s+have\s+this\s+in\s+their\s+(?:basket|cart)/i);
-        if (bm) { out.demand_signal = bm[0].trim(); out.sold_count = bm[1]; return out; }
+        m = t.match(/(\d+\+?)\s+people\s+have\s+this\s+in\s+their\s+(?:basket|cart)/i);
+        if (m) { o.demand_signal = m[0].trim(); o.sold_count = m[1]; return o; }
 
-        bm = t.match(/in\s+(\d+\+?)\s+(?:basket|cart)s?/i);
-        if (bm) { out.demand_signal = bm[0].trim(); out.sold_count = bm[1]; return out; }
+        m = t.match(/in\s+(\d+\+?)\s+(?:basket|cart)s?/i);
+        if (m) { o.demand_signal = m[0].trim(); o.sold_count = m[1]; return o; }
 
-        if (/bestseller/i.test(t)) { out.demand_signal = "Bestseller"; return out; }
-        if (/popular\s+now/i.test(t)) { out.demand_signal = "Popular now"; return out; }
+        if (/bestseller/i.test(t)) { o.demand_signal = "Bestseller"; return o; }
+        if (/popular\s+now/i.test(t)) { o.demand_signal = "Popular now"; return o; }
 
-        bm = t.match(/only\s+(\d+)\s+left/i);
-        if (bm) { out.demand_signal = bm[0].trim(); out.sold_count = bm[1]; return out; }
+        m = t.match(/only\s+(\d+)\s+left/i);
+        if (m) { o.demand_signal = m[0].trim(); o.sold_count = m[1]; return o; }
 
-        bm = t.match(/([\d,]+)\s+sales?/i);
-        if (bm) {
-          const n = parseInt(bm[1].replace(/,/g, ""), 10);
-          if (n >= 100) { out.sold_count = bm[1]; out.demand_signal = `${bm[1]} sales`; }
+        m = t.match(/([\d,]+)\s+sales?/i);
+        if (m) {
+          const n = parseInt(m[1].replace(/,/g, ""), 10);
+          if (n >= 100) { o.sold_count = m[1]; o.demand_signal = `${m[1]} sales`; }
         }
-
-        return out;
+        return o;
       },
     });
     return r[0]?.result || null;
-  } catch (e) {
-    console.log("[extract] error:", e.message);
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 // ============================================================
-// SCROLL search page (sync — no setTimeout)
-// ============================================================
-
-async function scrollPage(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const h = document.body.scrollHeight;
-        for (let i = 1; i <= 6; i++) window.scrollTo(0, (h * i) / 6);
-        window.scrollTo(0, 0);
-      },
-    });
-  } catch (e) {}
-}
-
-// ============================================================
-// PROGRESS
+// LOGGING + PROGRESS
 // ============================================================
 
 function tsLog(ts, msg) {
@@ -273,7 +226,7 @@ function tsLog(ts, msg) {
   console.log("[s]", msg);
 }
 
-async function updateProgress(ts) {
+async function reportProgress(ts) {
   if (!ts.searchId) return;
   try {
     await fetch(`${ts.backendUrl || DEFAULT_BACKEND}/api/queue/${ts.searchId}/progress`, {
@@ -293,248 +246,220 @@ async function updateProgress(ts) {
   } catch (e) {}
 }
 
-async function flushProducts(ts) {
+async function sendProducts(ts) {
   if (ts.matchingProducts.length === 0) return;
   const batch = ts.matchingProducts.splice(0);
-  console.log(`[flush] ${batch.length} products`);
   try {
     await fetch(`${ts.backendUrl || DEFAULT_BACKEND}/api/products`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ keyword: ts.keyword, products: batch }),
     });
+    console.log("[send] sent", batch.length);
   } catch (e) {
-    console.log("[flush] FAIL:", e.message);
+    console.log("[send] FAIL:", e.message);
     ts.matchingProducts.push(...batch);
   }
 }
 
-// ============================================================
-// PROCESS ONE FULL SEARCH PAGE + ITS TOP 20 LISTINGS
-//
-// All in one tick. Between listing visits, activeWait() keeps
-// the service worker alive via chrome.storage.local.get loops.
-// ============================================================
-
-async function processFullPage(ts) {
-  const tabId = await getTab();
-  const pageNum = ts.currentPage;
-  const backendUrl = ts.backendUrl || DEFAULT_BACKEND;
-
-  // ---- 1. Navigate to search page ----
-  const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(ts.keyword)}&ref=search_bar&page=${pageNum}`;
-  console.log(`[page ${pageNum}] loading search page, tab=${tabId}`);
-  tsLog(ts, `Page ${pageNum}/${ts.totalPages}: loading...`);
-
-  const ok = await navTab(tabId, searchUrl);
-  console.log(`[page ${pageNum}] loaded: ${ok}`);
-
-  if (!ok) {
-    tsLog(ts, `Page ${pageNum}: load failed, skipping.`);
-    return true; // skip, don't error
-  }
-
-  // Brief active wait for DOM
-  await activeWait(500);
-
-  // Captcha?
-  if (await isCaptcha(tabId)) {
-    console.log(`[page ${pageNum}] CAPTCHA!`);
-    tsLog(ts, `Page ${pageNum}: CAPTCHA detected. Stopping.`);
-    ts.status = "error";
-    return false;
-  }
-
-  // ---- 2. Scroll to trigger lazy loading ----
-  await scrollPage(tabId);
-  await activeWait(300);
-
-  // ---- 3. Collect + score listings ----
-  const { total, listings } = await collectAndScoreListings(tabId);
-  console.log(`[page ${pageNum}] ${total} total listings, ${listings.length} scored`);
-
-  if (listings.length === 0) {
-    tsLog(ts, `Page ${pageNum}: no listings found.`);
-    return true;
-  }
-
-  // Sort by score descending, take top N
-  listings.sort((a, b) => b.score - a.score);
-  const top = listings.slice(0, LISTINGS_PER_PAGE);
-  console.log(`[page ${pageNum}] visiting top ${top.length} listings (scores: ${top.map(l => l.score).join(",")})`);
-  tsLog(ts, `Page ${pageNum}: ${total} listings, visiting top ${top.length}.`);
-
-  // ---- 4. Visit each listing one at a time ----
-  for (let i = 0; i < top.length; i++) {
-    const listing = top[i];
-    ts.listingsChecked++;
-
-    console.log(`[page ${pageNum}] listing ${i + 1}/${top.length}: ${listing.listingId} (score=${listing.score})`);
-
-    // Navigate same tab to listing (preserves referrer from search page)
-    const navOk = await navTab(tabId, listing.url);
-    if (!navOk) {
-      console.log(`[page ${pageNum}] listing ${listing.listingId} load failed`);
-      continue;
-    }
-
-    // Brief wait for DOM
-    await activeWait(300);
-
-    // Captcha?
-    if (await isCaptcha(tabId)) {
-      console.log(`[page ${pageNum}] CAPTCHA on listing!`);
-      tsLog(ts, "CAPTCHA on listing page. Stopping.");
-      ts.status = "error";
-      return false;
-    }
-
-    // Extract
-    const data = await extractListing(tabId);
-
-    if (data && data.demand_signal) {
-      ts.productsFound++;
-      ts.matchingProducts.push({
-        title: data.title || listing.cardTitle || "",
-        url: listing.url,
-        image_url: data.image_url || listing.cardImage || "",
-        sold_count: data.demand_signal,
-        price: data.price || "",
-        shop_name: data.shop_name || "",
-      });
-      console.log(`[page ${pageNum}] ✓ ${data.demand_signal} — ${(data.title || "").substring(0, 50)}`);
-      tsLog(ts, `✓ ${data.demand_signal} — ${(data.title || listing.cardTitle || "").substring(0, 50)}`);
-    }
-
-    // Flush every 10
-    if (ts.matchingProducts.length >= 10) {
-      await flushProducts(ts);
-    }
-
-    // Active wait ~3s between listings (keeps worker alive)
-    if (i < top.length - 1) {
-      const waitIters = gaussRand(1500, 400, 800, 2500);
-      await activeWait(waitIters);
-    }
-  }
-
-  // ---- 5. Flush remaining ----
-  await flushProducts(ts);
-
-  // ---- 6. Navigate back to search page (for referrer chain) ----
-  // This also prepares the tab for the next page
-  console.log(`[page ${pageNum}] navigating back to search`);
-  await navTab(tabId, searchUrl);
-  await activeWait(200);
-
-  tsLog(ts, `Page ${pageNum} done. ${ts.listingsChecked} checked, ${ts.productsFound} found.`);
-  console.log(`[page ${pageNum}] COMPLETE`);
-
-  return true;
+async function save(ts) {
+  await chrome.storage.local.set({ tickState: ts });
 }
 
 // ============================================================
-// MAIN TICK — one alarm = warmup OR one full search page
+// PROCESS TICK
+//
+// warmup: visit homepage → schedule next
+// search: load search page, collect URLs → schedule next
+// batch:  visit next 5 listings sequentially in same tab → schedule next
 // ============================================================
 
 async function processTick() {
-  console.log("[tick] ===== START =====");
+  console.log("[tick] =====");
 
   let ts;
   try {
-    const data = await chrome.storage.local.get(["tickState", "backendUrl"]);
+    const data = await chrome.storage.local.get(["tickState"]);
     ts = data.tickState;
     if (!ts) { console.log("[tick] no state"); return; }
     if (ts.status !== "running") { console.log("[tick] status:", ts.status); return; }
-    if (data.backendUrl) ts.backendUrl = data.backendUrl;
-  } catch (e) {
-    console.error("[tick] storage read error:", e);
-    return;
-  }
+  } catch (e) { console.error("[tick] storage err:", e); return; }
 
   try {
-    console.log(`[tick] phase=${ts.phase} page=${ts.currentPage}/${ts.totalPages} checked=${ts.listingsChecked} found=${ts.productsFound}`);
+    const tabId = await getTab();
+    console.log(`[tick] phase=${ts.phase} page=${ts.currentPage}/${ts.totalPages} q=${(ts.queue || []).length} tab=${tabId}`);
 
-    // ---- WARMUP ----
+    // ==== WARMUP ====
     if (ts.phase === "warmup") {
       console.log("[tick] WARMUP");
-      tsLog(ts, "Warming up — visiting Etsy homepage...");
-
-      const tabId = await getTab();
-      console.log("[tick] tab:", tabId);
-
-      const ok = await navTab(tabId, "https://www.etsy.com");
-      console.log("[tick] homepage loaded:", ok);
-
-      await activeWait(500);
+      tsLog(ts, "Visiting Etsy homepage...");
+      await navTab(tabId, "https://www.etsy.com");
+      // A few chrome API calls as brief pause
+      for (let i = 0; i < 200; i++) await chrome.storage.local.get(["_kl"]);
 
       ts.phase = "search";
       ts.currentPage = 0;
-      await chrome.storage.local.set({ tickState: ts });
-      await updateProgress(ts);
-
-      console.log("[tick] warmup done, scheduling first search page");
+      await save(ts);
+      await reportProgress(ts);
+      console.log("[tick] warmup done");
       chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
       return;
     }
 
-    // ---- SEARCH — process one full page ----
+    // ==== BATCH — visit next 5 listings from queue ====
+    if (ts.phase === "batch" && ts.queue && ts.queue.length > 0) {
+      const batch = ts.queue.splice(0, BATCH_SIZE);
+      console.log(`[tick] BATCH: ${batch.length} listings (${ts.queue.length} left)`);
+
+      for (const listing of batch) {
+        // Navigate same tab to listing
+        const ok = await navTab(tabId, listing.url);
+        if (!ok) { console.log("[tick] nav failed:", listing.id); ts.listingsChecked++; continue; }
+
+        // Captcha?
+        if (await isCaptcha(tabId)) {
+          console.log("[tick] CAPTCHA!");
+          tsLog(ts, "CAPTCHA detected. Stopping.");
+          ts.queue.unshift(listing); // put it back
+          ts.status = "error";
+          await save(ts);
+          await reportProgress(ts);
+          return;
+        }
+
+        // Extract immediately — no scrolling needed
+        const data = await extractListing(tabId);
+        ts.listingsChecked++;
+
+        if (data && data.demand_signal) {
+          ts.productsFound++;
+          ts.matchingProducts.push({
+            title: data.title || listing.title || "",
+            url: listing.url,
+            image_url: data.image_url || listing.img || "",
+            sold_count: data.demand_signal,
+            price: data.price || "",
+            shop_name: data.shop_name || "",
+          });
+          console.log(`[tick] ✓ ${data.demand_signal} — ${(data.title || "").substring(0, 50)}`);
+          tsLog(ts, `✓ ${data.demand_signal} — ${(data.title || listing.title || "").substring(0, 50)}`);
+        }
+      }
+
+      // Send products to backend
+      if (ts.matchingProducts.length >= 5) {
+        await sendProducts(ts);
+      }
+
+      await save(ts);
+
+      // More in queue?
+      if (ts.queue.length > 0) {
+        console.log(`[tick] ${ts.queue.length} left in queue`);
+        chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
+      } else {
+        // Queue exhausted — done with this search page
+        tsLog(ts, `Page ${ts.currentPage} done. ${ts.listingsChecked} checked, ${ts.productsFound} found.`);
+        await reportProgress(ts);
+        ts.phase = "search";
+        await save(ts);
+        console.log("[tick] queue empty, next search page");
+        chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
+      }
+      return;
+    }
+
+    // ==== SEARCH — load next search page, collect listings ====
     if (ts.phase === "search") {
       ts.currentPage++;
 
+      // All done?
       if (ts.currentPage > ts.totalPages) {
         console.log("[tick] ALL DONE");
         ts.status = "completed";
-        tsLog(ts, `Done! ${ts.listingsChecked} listings checked, ${ts.productsFound} with demand signals.`);
-        await flushProducts(ts);
-        await chrome.storage.local.set({ tickState: ts });
-        await updateProgress(ts);
+        tsLog(ts, `Done! ${ts.listingsChecked} checked, ${ts.productsFound} with demand signals.`);
+        await sendProducts(ts);
+        await save(ts);
+        await reportProgress(ts);
         // Clean up tab
-        const data = await chrome.storage.local.get(["tabId"]);
-        if (data.tabId) { try { await chrome.tabs.remove(data.tabId); } catch (e) {} }
+        try { await chrome.tabs.remove(tabId); } catch (e) {}
         await chrome.storage.local.remove("tabId");
         return;
       }
 
-      // Process the entire page (search + all top listings)
-      const ok = await processFullPage(ts);
+      console.log(`[tick] SEARCH page ${ts.currentPage}`);
+      tsLog(ts, `Loading search page ${ts.currentPage}/${ts.totalPages}...`);
 
-      await chrome.storage.local.set({ tickState: ts });
-      await updateProgress(ts);
-
+      const searchUrl = `https://www.etsy.com/search?q=${encodeURIComponent(ts.keyword)}&ref=search_bar&page=${ts.currentPage}`;
+      const ok = await navTab(tabId, searchUrl);
       if (!ok) {
-        // Error (captcha) — stop
-        console.log("[tick] page returned error, stopping");
+        console.log("[tick] search page load failed");
+        tsLog(ts, `Page ${ts.currentPage}: load failed, skipping.`);
+        await save(ts);
+        chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
         return;
       }
 
-      // Schedule next page
-      const delayMin = gaussRand(60, 15, 40, 90) / 60;
-      const extra = (ts.currentPage % 5 === 0) ? gaussRand(30, 10, 15, 45) / 60 : 0;
-      const totalMin = Math.max(0.5, delayMin + extra); // at least 30s
+      // Brief pause via chrome API calls
+      for (let i = 0; i < 100; i++) await chrome.storage.local.get(["_kl"]);
 
-      console.log(`[tick] next page in ~${Math.round(totalMin * 60)}s`);
-      tsLog(ts, `Next page in ~${Math.round(totalMin * 60)}s...`);
-      await chrome.storage.local.set({ tickState: ts });
+      // Captcha?
+      if (await isCaptcha(tabId)) {
+        console.log("[tick] CAPTCHA on search page!");
+        tsLog(ts, "CAPTCHA on search page. Stopping.");
+        ts.currentPage--;
+        ts.status = "error";
+        await save(ts);
+        await reportProgress(ts);
+        return;
+      }
 
-      chrome.alarms.create(ALARM_NAME, { delayInMinutes: totalMin });
+      // Scroll to load lazy content
+      await scrollPage(tabId);
+      for (let i = 0; i < 50; i++) await chrome.storage.local.get(["_kl"]);
+
+      // Collect listings
+      const listings = await collectListings(tabId);
+      console.log(`[tick] collected ${listings.length} listings`);
+
+      if (listings.length === 0) {
+        tsLog(ts, `Page ${ts.currentPage}: no listings.`);
+        await save(ts);
+        chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
+        return;
+      }
+
+      // Shuffle for natural browsing
+      for (let i = listings.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [listings[i], listings[j]] = [listings[j], listings[i]];
+      }
+
+      ts.queue = listings;
+      ts.phase = "batch";
+      tsLog(ts, `Page ${ts.currentPage}: ${listings.length} listings queued.`);
+      await save(ts);
+      await reportProgress(ts);
+
+      // Schedule first batch
+      console.log("[tick] listings queued, scheduling first batch");
+      chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
       return;
     }
 
     // Unknown phase
-    console.log("[tick] unknown phase:", ts.phase, "resetting");
+    console.log("[tick] unknown phase:", ts.phase);
     ts.phase = "search";
-    await chrome.storage.local.set({ tickState: ts });
+    await save(ts);
     chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.1 });
 
   } catch (e) {
-    console.error("[tick] CRASH:", e.message);
-    console.error("[tick] stack:", e.stack);
+    console.error("[tick] CRASH:", e.message, e.stack);
     if (ts) {
-      tsLog(ts, `Crash: ${e.message}`);
+      tsLog(ts, `Error: ${e.message}`);
       ts.status = "error";
-      await chrome.storage.local.set({ tickState: ts });
-      await updateProgress(ts);
+      await save(ts);
+      await reportProgress(ts);
     }
   }
 }
@@ -546,7 +471,7 @@ async function processTick() {
 async function startAlarmSearch(keyword, searchId, backendUrl) {
   console.log(`[start] "${keyword}" id=${searchId}`);
 
-  // Clean up any stale tabs from previous searches
+  // Clean stale tab
   const old = await chrome.storage.local.get(["tabId"]);
   if (old.tabId) {
     try { await chrome.tabs.remove(old.tabId); } catch (e) {}
@@ -557,6 +482,7 @@ async function startAlarmSearch(keyword, searchId, backendUrl) {
     keyword, searchId, backendUrl,
     currentPage: 0,
     totalPages: TOTAL_SEARCH_PAGES,
+    queue: [],
     matchingProducts: [],
     listingsChecked: 0,
     productsFound: 0,
@@ -564,17 +490,12 @@ async function startAlarmSearch(keyword, searchId, backendUrl) {
     status: "running",
     phase: "warmup",
   };
-  await chrome.storage.local.set({ tickState });
-  await updateProgress(tickState);
+  await save(tickState);
+  await reportProgress(tickState);
 
-  // Run first tick inline immediately
-  console.log("[start] running first tick inline");
-  try {
-    await processTick();
-  } catch (e) {
-    console.error("[start] inline tick error:", e);
-    chrome.alarms.create(ALARM_NAME, { delayInMinutes: 0.5 });
-  }
+  // Run first tick inline (warmup)
+  console.log("[start] running warmup inline");
+  await processTick();
 }
 
 // ============================================================
@@ -589,7 +510,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   } else if (msg.type === "cancelSearch") {
     (async () => {
       const d = await chrome.storage.local.get(["tickState"]);
-      if (d.tickState) { d.tickState.status = "cancelled"; await chrome.storage.local.set({ tickState: d.tickState }); await updateProgress(d.tickState); }
+      if (d.tickState) { d.tickState.status = "cancelled"; await save(d.tickState); await reportProgress(d.tickState); }
       chrome.alarms.clear(ALARM_NAME);
       const t = await chrome.storage.local.get(["tabId"]);
       if (t.tabId) { try { await chrome.tabs.remove(t.tabId); } catch (e) {} }
@@ -614,7 +535,7 @@ async function pollForQueuedSearches() {
     const d = await chrome.storage.local.get(["backendUrl", "tickState"]);
     if (d.backendUrl) backendUrl = d.backendUrl;
     if (d.tickState && d.tickState.status === "running") {
-      console.log("[poll] active:", d.tickState.phase, "page:", d.tickState.currentPage);
+      console.log("[poll] active:", d.tickState.phase, "p:", d.tickState.currentPage, "q:", (d.tickState.queue || []).length);
       return;
     }
     if (d.tickState) {
@@ -633,7 +554,7 @@ async function pollForQueuedSearches() {
       await fetch(`${backendUrl}/api/queue/${s.search_id}/claim`, { method: "POST" });
       await startAlarmSearch(s.keyword, s.search_id, backendUrl);
     }
-  } catch (e) { console.log("[poll] error:", e.message); }
+  } catch (e) { console.log("[poll] err:", e.message); }
 }
 
 // ============================================================
@@ -653,8 +574,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("pollQueue", { periodInMinutes: 1 });
   pollForQueuedSearches();
 });
+chrome.runtime.onStartup.addListener(() => pollForQueuedSearches());
 
-chrome.runtime.onStartup.addListener(() => { pollForQueuedSearches(); });
-
-console.log("[init] v6.0 loaded");
+console.log("[init] v7.0 loaded");
 pollForQueuedSearches();
